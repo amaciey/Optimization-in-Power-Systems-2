@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 from gurobipy import GRB
 
-from .data_loader import InputData
+from .data_loader import CommunityData, InputData
 
 
 @dataclass
@@ -264,6 +264,29 @@ class DisutilityConsumer(FlexibleConsumerModel):
 
         m.update()
         return self
+
+
+class Community:
+    """Collection of member-level disutility consumer models."""
+
+    def __init__(
+        self,
+        data: CommunityData,
+        contract_type: str = "R",
+        verbose: bool = False,
+    ):
+        self.data = data
+        self.consumers: dict[str, DisutilityConsumer] = {}
+
+        for member in data.members:
+            if member.consumer_id in self.consumers:
+                raise ValueError(f"Duplicate community member id: {member.consumer_id!r}")
+            self.consumers[member.consumer_id] = DisutilityConsumer(
+                data=member,
+                name=f"{data.community}_{member.consumer_id}",
+                verbose=verbose,
+                contract_type=contract_type,
+            )
 
 
 _STATUS = {
