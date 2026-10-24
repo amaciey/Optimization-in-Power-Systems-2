@@ -7,3 +7,5 @@ __pycache__/
 .Python
 venv/
 env/   
+src/model-a1.py
+.vscode/settings.json

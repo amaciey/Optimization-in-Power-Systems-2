@@ -185,6 +185,7 @@ class DisutilityConsumer(FlexibleConsumerModel):
         contract_type: str = "R"
     ):
         super().__init__(data=data, name=name, verbose=verbose)
+        self.contract_type = contract_type
     
     def build(self) -> "DisutilityConsumer":
         """Declare decision variables, objective and constraints."""
@@ -209,28 +210,10 @@ class DisutilityConsumer(FlexibleConsumerModel):
         c_L = d.linear_disutility if d.linear_disutility is not None else 0.0
         ref_load = d.reference_load if d.reference_load is not None else np.zeros(len(T))
 
-        # Defining the new battery parameters
-        E_cap = d.battery_capacity_kWh
-        P_ch_max = d.battery_max_charge_kW
-        P_dis_max = d.battery_max_discharge_kW
-        eta_ch = d.battery_charging_efficiency
-        eta_dis = d.battery_discharging_efficiency
-        E_0 = d.battery_initial_soc_kWh
-
-        self.var["charge"] = m.addVars(T, lb=-GRB.INFINITY, vtype=GRB.CONTINUOUS, name="charge")
-        self.var["discharge"] = m.addVars(T, lb=-GRB.INFINITY, vtype=GRB.CONTINUOUS, name="discharge")
-        self.var["soc"] = m.addVars(T, lb=-GRB.INFINITY, vtype=GRB.CONTINUOUS, name="soc")
-        p_ch, p_dis, e = self.var["charge"], self.var["discharge"], self.var["soc"]
-
-        # TODO: Use contract_type parameter to set-up different constraints and objectives
         # --- Objective ---------------------------------------------------------------
         # Minimize total cost: procurement costs + PV costs + linear disutility penalty
         m.setObjective(
             gp.quicksum(p_imp[t]*P_imp[t] - p_exp[t]*P_exp[t] + c_pv*PV[t] + c_L*(delta_pos[t] + delta_neg[t]) for t in T), GRB.MINIMIZE)
-
-        m.remove(list(self.con["balance"].values()))
-        self.con["balance"] = m.addConstrs(
-            (L[t] + P_exp[t] + p_ch[t] - PV[t] - P_imp[t] - p_dis[t] == 0 for t in T), name="balance")
 
         # --- Constraints -------------------------------------------------------------
         # Linear deviation link: L_t - reference_load_t = delta_pos_t - delta_neg_t
@@ -244,23 +227,101 @@ class DisutilityConsumer(FlexibleConsumerModel):
         self.con["delta_neg_min"] = m.addConstrs(
             (-delta_neg[t] <= 0 for t in T), name="delta_neg_min")
 
-        # Define the SoC constraint
+        m.update()
+        return self
+
+
+class BatteryDisutilityConsumer(DisutilityConsumer):
+    """Linear-disutility consumer model with an explicitly configured battery."""
+
+    def _battery_parameters(self) -> tuple[float, float, float, float, float, float, float]:
+        d = self.data
+        values = {
+            "battery_capacity_kWh": d.battery_capacity_kWh,
+            "battery_max_charge_kW": d.battery_max_charge_kW,
+            "battery_max_discharge_kW": d.battery_max_discharge_kW,
+            "battery_charging_efficiency": d.battery_charging_efficiency,
+            "battery_discharging_efficiency": d.battery_discharging_efficiency,
+            "battery_initial_soc_kWh": d.battery_initial_soc_kWh,
+        }
+        missing = [name for name, value in values.items() if value is None]
+        if missing:
+            raise ValueError(
+                f"Incomplete battery data for {d.consumer_id!r}; missing: {', '.join(missing)}"
+            )
+
+        capacity = values["battery_capacity_kWh"]
+        max_charge = values["battery_max_charge_kW"]
+        max_discharge = values["battery_max_discharge_kW"]
+        charging_efficiency = values["battery_charging_efficiency"]
+        discharging_efficiency = values["battery_discharging_efficiency"]
+        initial_soc = values["battery_initial_soc_kWh"]
+        assert capacity is not None
+        assert max_charge is not None
+        assert max_discharge is not None
+        assert charging_efficiency is not None
+        assert discharging_efficiency is not None
+        assert initial_soc is not None
+
+        if capacity < 0 or max_charge < 0 or max_discharge < 0:
+            raise ValueError(f"Battery capacities and power limits must be non-negative for {d.consumer_id!r}.")
+        if not 0 < charging_efficiency <= 1 or not 0 < discharging_efficiency <= 1:
+            raise ValueError(f"Battery efficiencies must be in (0, 1] for {d.consumer_id!r}.")
+        if not 0 <= initial_soc <= capacity:
+            raise ValueError(f"Initial battery state of charge must be within capacity for {d.consumer_id!r}.")
+        if d.battery_final_soc_kWh is not None and not 0 <= d.battery_final_soc_kWh <= capacity:
+            raise ValueError(f"Final battery state of charge must be within capacity for {d.consumer_id!r}.")
+
+        final_soc = d.battery_final_soc_kWh if d.battery_final_soc_kWh is not None else initial_soc
+        return (
+            capacity,
+            max_charge,
+            max_discharge,
+            charging_efficiency,
+            discharging_efficiency,
+            initial_soc,
+            final_soc,
+        )
+
+    def build(self) -> "BatteryDisutilityConsumer":
+        super().build()
+        d, m, T = self.data, self.m, self.T
+        E_cap, P_ch_max, P_dis_max, eta_ch, eta_dis, E_0, E_final = self._battery_parameters()
+        load = self.var["load"]
+        pv = self.var["pv"]
+        imports = self.var["import"]
+        exports = self.var["export"]
+
+        self.var["charge"] = m.addVars(T, lb=0.0, vtype=GRB.CONTINUOUS, name="charge")
+        self.var["discharge"] = m.addVars(T, lb=0.0, vtype=GRB.CONTINUOUS, name="discharge")
+        self.var["soc"] = m.addVars(T, lb=0.0, ub=E_cap, vtype=GRB.CONTINUOUS, name="soc")
+        charge = self.var["charge"]
+        discharge = self.var["discharge"]
+        soc = self.var["soc"]
+
+        m.remove(list(self.con["balance"].values()))
+        self.con["balance"] = m.addConstrs(
+            (load[t] + exports[t] + charge[t] - pv[t] - imports[t] - discharge[t] == 0 for t in T),
+            name="balance",
+        )
         self.con["soc_dynamics"] = m.addConstrs(
-            (e[t] - (E_0 if t == 0 else e[t - 1]) - eta_ch * p_ch[t] + p_dis[t] / eta_dis == 0 for t in T),
-            name="soc_dynamics")
-
-        # Chargin/Discharging power limits
-        self.con["charge_min"] = m.addConstrs((-p_ch[t] <= 0 for t in T), name="charge_min")
-        self.con["charge_max"] = m.addConstrs((p_ch[t] - P_ch_max <= 0 for t in T), name="charge_max")
-        self.con["discharge_min"] = m.addConstrs((-p_dis[t] <= 0 for t in T), name="discharge_min")
-        self.con["discharge_max"] = m.addConstrs((p_dis[t] - P_dis_max <= 0 for t in T), name="discharge_max")
-
-        # Defining 0 <= e_t <= E_cap
-        self.con["soc_min"] = m.addConstrs((-e[t] <= 0 for t in T), name="soc_min")
-        self.con["soc_max"] = m.addConstrs((e[t] - E_cap <= 0 for t in T), name="soc_max")
-
-        # SoC at the end of the day 
-        self.con["soc_end"] = m.addConstr(e[T[-1]] == E_0, name="soc_end")
+            (
+                soc[t]
+                - (E_0 if t == 0 else soc[t - 1])
+                - eta_ch * charge[t]
+                + discharge[t] / eta_dis
+                == 0
+                for t in T
+            ),
+            name="soc_dynamics",
+        )
+        self.con["charge_max"] = m.addConstrs(
+            (charge[t] <= P_ch_max for t in T), name="charge_max"
+        )
+        self.con["discharge_max"] = m.addConstrs(
+            (discharge[t] <= P_dis_max for t in T), name="discharge_max"
+        )
+        self.con["soc_end"] = m.addConstr(soc[T[-1]] == E_final, name="soc_end")
 
         m.update()
         return self
@@ -276,12 +337,13 @@ class Community:
         verbose: bool = False,
     ):
         self.data = data
-        self.consumers: dict[str, DisutilityConsumer] = {}
+        self.consumers: dict[str, DisutilityConsumer | BatteryDisutilityConsumer] = {}
 
         for member in data.members:
             if member.consumer_id in self.consumers:
                 raise ValueError(f"Duplicate community member id: {member.consumer_id!r}")
-            self.consumers[member.consumer_id] = DisutilityConsumer(
+            consumer_class = BatteryDisutilityConsumer if member.has_battery else DisutilityConsumer
+            self.consumers[member.consumer_id] = consumer_class(
                 data=member,
                 name=f"{data.community}_{member.consumer_id}",
                 verbose=verbose,
