@@ -51,7 +51,7 @@ def _dual(c) -> float:
 
 
 class FlexibleConsumerModel:
-    """Consumption problem of one consumer over a 24-hour horizon (Question 1); extend it for Questions 2 and 3."""
+    """TODO: Add docstring"""
 
     def __init__(self, data: InputData, name: str = "flexible_consumer", verbose: bool = False):
         self.data = data
@@ -176,19 +176,13 @@ class FlexibleConsumerModel:
         )
 
 class DisutilityConsumer(FlexibleConsumerModel):
-    """Linear disutility consumer model (Question 2.(b)).
-
-    Penalizes deviations from the hourly reference consumption target reference_load
-    using a linear cost coefficient linear_disutility.
-    """
-    # TODO: Add battery parameters
-    # TODO: Parameterize for the three models
 
     def __init__(
         self,
         data: InputData,
         name: str = "disutility_consumer",
         verbose: bool = False,
+        contract_type: str = "R"
     ):
         super().__init__(data=data, name=name, verbose=verbose)
     
@@ -215,10 +209,28 @@ class DisutilityConsumer(FlexibleConsumerModel):
         c_L = d.linear_disutility if d.linear_disutility is not None else 0.0
         ref_load = d.reference_load if d.reference_load is not None else np.zeros(len(T))
 
+        # Defining the new battery parameters
+        E_cap = d.battery_capacity_kWh
+        P_ch_max = d.battery_max_charge_kW
+        P_dis_max = d.battery_max_discharge_kW
+        eta_ch = d.battery_charging_efficiency
+        eta_dis = d.battery_discharging_efficiency
+        E_0 = d.battery_initial_soc_kWh
+
+        self.var["charge"] = m.addVars(T, lb=-GRB.INFINITY, vtype=GRB.CONTINUOUS, name="charge")
+        self.var["discharge"] = m.addVars(T, lb=-GRB.INFINITY, vtype=GRB.CONTINUOUS, name="discharge")
+        self.var["soc"] = m.addVars(T, lb=-GRB.INFINITY, vtype=GRB.CONTINUOUS, name="soc")
+        p_ch, p_dis, e = self.var["charge"], self.var["discharge"], self.var["soc"]
+
+        # TODO: Use contract_type parameter to set-up different constraints and objectives
         # --- Objective ---------------------------------------------------------------
         # Minimize total cost: procurement costs + PV costs + linear disutility penalty
         m.setObjective(
             gp.quicksum(p_imp[t]*P_imp[t] - p_exp[t]*P_exp[t] + c_pv*PV[t] + c_L*(delta_pos[t] + delta_neg[t]) for t in T), GRB.MINIMIZE)
+
+        m.remove(list(self.con["balance"].values()))
+        self.con["balance"] = m.addConstrs(
+            (L[t] + P_exp[t] + p_ch[t] - PV[t] - P_imp[t] - p_dis[t] == 0 for t in T), name="balance")
 
         # --- Constraints -------------------------------------------------------------
         # Linear deviation link: L_t - reference_load_t = delta_pos_t - delta_neg_t
@@ -232,5 +244,34 @@ class DisutilityConsumer(FlexibleConsumerModel):
         self.con["delta_neg_min"] = m.addConstrs(
             (-delta_neg[t] <= 0 for t in T), name="delta_neg_min")
 
+        # Define the SoC constraint
+        self.con["soc_dynamics"] = m.addConstrs(
+            (e[t] - (E_0 if t == 0 else e[t - 1]) - eta_ch * p_ch[t] + p_dis[t] / eta_dis == 0 for t in T),
+            name="soc_dynamics")
+
+        # Chargin/Discharging power limits
+        self.con["charge_min"] = m.addConstrs((-p_ch[t] <= 0 for t in T), name="charge_min")
+        self.con["charge_max"] = m.addConstrs((p_ch[t] - P_ch_max <= 0 for t in T), name="charge_max")
+        self.con["discharge_min"] = m.addConstrs((-p_dis[t] <= 0 for t in T), name="discharge_min")
+        self.con["discharge_max"] = m.addConstrs((p_dis[t] - P_dis_max <= 0 for t in T), name="discharge_max")
+
+        # Defining 0 <= e_t <= E_cap
+        self.con["soc_min"] = m.addConstrs((-e[t] <= 0 for t in T), name="soc_min")
+        self.con["soc_max"] = m.addConstrs((e[t] - E_cap <= 0 for t in T), name="soc_max")
+
+        # SoC at the end of the day 
+        self.con["soc_end"] = m.addConstr(e[T[-1]] == E_0, name="soc_end")
+
         m.update()
         return self
+
+
+_STATUS = {
+    GRB.OPTIMAL: "OPTIMAL", GRB.INFEASIBLE: "INFEASIBLE", GRB.UNBOUNDED: "UNBOUNDED",
+    GRB.INF_OR_UNBD: "INF_OR_UNBD", GRB.TIME_LIMIT: "TIME_LIMIT", GRB.SUBOPTIMAL: "SUBOPTIMAL",
+    GRB.NUMERIC: "NUMERIC", GRB.INTERRUPTED: "INTERRUPTED",
+}
+
+
+def _status_name(code: int) -> str:
+    return _STATUS.get(code, f"STATUS_{code}")
