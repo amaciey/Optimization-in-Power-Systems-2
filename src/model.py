@@ -289,6 +289,79 @@ class Community:
             )
 
 
+class CommunityOptimizationModel:
+    """Build and solve a community formulation from shared community data.
+
+    The current repository has member-level equations for the reference and
+    individual-contract cases. Centralized and dynamic-pricing formulations
+    require assignment-specific equations that are not yet represented here.
+    """
+
+    _SUPPORTED_FORMULATIONS = {"R", "I"}
+
+    def __init__(
+        self,
+        community: CommunityData,
+        formulation: str,
+        verbose: bool = False,
+    ):
+        self.community = community
+        self.formulation = formulation.upper()
+        self.verbose = verbose
+        self.model: Community | None = None
+        self.results: dict[str, Results] | None = None
+        self._validate_community()
+
+    def _validate_community(self) -> None:
+        """Validate dimensions shared by every member model."""
+        if not self.community.members:
+            raise ValueError("CommunityOptimizationModel requires at least one member.")
+
+        n_hours = self.community.members[0].n_hours
+        if n_hours == 0:
+            raise ValueError("Community members must contain at least one time period.")
+        if any(member.n_hours != n_hours for member in self.community.members):
+            raise ValueError("All community members must use the same time horizon.")
+
+        if self.formulation not in self._SUPPORTED_FORMULATIONS:
+            raise NotImplementedError(
+                f"Formulation {self.formulation!r} is not implemented; "
+                f"available formulations: {sorted(self._SUPPORTED_FORMULATIONS)}."
+            )
+
+    def build_model(self) -> "CommunityOptimizationModel":
+        """Construct fresh member models for the selected formulation."""
+        contract_type = self.formulation
+        self.model = Community(
+            data=self.community,
+            contract_type=contract_type,
+            verbose=self.verbose,
+        )
+        for consumer in self.model.consumers.values():
+            consumer.build()
+        self.results = None
+        return self
+
+    def solve(self) -> dict[str, Results]:
+        """Solve every member model and return results keyed by member ID."""
+        if self.model is None:
+            self.build_model()
+
+        if self.model is None:
+            raise RuntimeError("CommunityOptimizationModel failed to build its member models.")
+        self.results = {
+            member_id: consumer.solve()
+            for member_id, consumer in self.model.consumers.items()
+        }
+        return self.results
+
+    def extract_results(self) -> dict[str, Results]:
+        """Return solved member results without re-solving the models."""
+        if self.results is None:
+            raise RuntimeError("CommunityOptimizationModel has not been solved yet.")
+        return self.results
+
+
 _STATUS = {
     GRB.OPTIMAL: "OPTIMAL", GRB.INFEASIBLE: "INFEASIBLE", GRB.UNBOUNDED: "UNBOUNDED",
     GRB.INF_OR_UNBD: "INF_OR_UNBD", GRB.TIME_LIMIT: "TIME_LIMIT", GRB.SUBOPTIMAL: "SUBOPTIMAL",
