@@ -402,7 +402,7 @@ class BatteryDisutilityConsumer(DisutilityConsumer):
 
 
 class Community:
-    """Collection of member-level disutility consumer models."""
+    """Community model for independent R/I meters or one joint C meter."""
 
     def __init__(
         self,
@@ -411,10 +411,24 @@ class Community:
         verbose: bool = False,
     ):
         self.data = data
+        self.contract_type = contract_type.upper()
+        self.verbose = verbose
         self.consumers: dict[str, DisutilityConsumer | BatteryDisutilityConsumer] = {}
+        self.m: gp.Model | None = None
+        self.var = {}
+        self.con = {}
 
+        # using different gurobi model for the community "C" case compared to the "R" and "I" cases
+        if self.contract_type == "C":
+            self.m = gp.Model(f"{data.community}_C")
+            self.m.Params.OutputFlag = int(verbose)
+            self.m.Params.Method = 1
+            self.m.Params.Threads = 1
+            return
+
+        # Adding members to the self.consumers dict according to the json data passed in to the class
         for member in data.members:
-            if member.consumer_id in self.consumers:
+            if member.consumer_id in self.consumers: 
                 raise ValueError(f"Duplicate community member id: {member.consumer_id!r}")
             consumer_class = BatteryDisutilityConsumer if member.has_battery else DisutilityConsumer
             self.consumers[member.consumer_id] = consumer_class(
@@ -425,16 +439,157 @@ class Community:
                 contract=data.contract
             )
 
+    def build(self) -> "Community":
+        """Build independent member models or the joint community model."""
+        if self.contract_type != "C":
+            for consumer in self.consumers.values():
+                consumer.build() # builds an individual model for each consumer if the contract type is not "C"
+            return self
+
+        if self.m is None:
+            raise RuntimeError("Community C model was not initialized.")
+        d, m, T = self.data, self.m, range(self.data.members[0].n_hours)
+        contract, first = d.contract, d.members[0]
+        
+        # Defining contract terms as variables
+        beta = contract.tariff_discount_ratio
+        alpha = contract.penalty_DKK_per_kWh
+        discounted_import = (1 - beta) * first.import_tariff
+        discounted_export = (1 - beta) * first.export_tariff
+        
+        # Errors out if malformed contract values for "C" case
+        if contract.export_capacity_limit_kW is not None:
+            raise ValueError("Community formulation C does not support an export capacity limit.")
+        if alpha < discounted_import:
+            raise ValueError("C requires alpha to be at least the discounted import tariff.")
+
+        members = {}
+        private_cost = gp.LinExpr()
+        for member in d.members:
+            if member.quadratic_disutility not in (None, 0) or member.consumption_utility not in (None, 0):
+                raise ValueError("C supports the supplied linear-disutility load only.")
+            cid = member.consumer_id
+            
+            # Adds variables to gurobi model
+            values = {
+                "load": m.addVars(T, lb={t: float(member.load_lower_kWh[t]) for t in T},
+                                  ub={t: float(member.load_upper_kWh[t]) for t in T}, name=f"load_{cid}"),
+                "pv": m.addVars(T, lb=0, ub={t: float(member.pv_available[t]) for t in T}, name=f"pv_{cid}"),
+                "delta_pos": m.addVars(T, lb=0, name=f"delta_pos_{cid}"),
+                "delta_neg": m.addVars(T, lb=0, name=f"delta_neg_{cid}"),
+            }
+
+            # Adds constraints to gurobi model
+            m.addConstrs((values["load"][t] - member.reference_load[t] ==
+                          values["delta_pos"][t] - values["delta_neg"][t] for t in T), name=f"deviation_{cid}")
+            m.addConstr(gp.quicksum(values["load"][t] for t in T) >= member.min_daily_energy_kWh,
+                        name=f"min_daily_energy_{cid}")
+
+            # Adds battery-specific variables and constraints if the consumer has a battery
+            if member.has_battery:
+                values["charge"] = m.addVars(T, lb=0, ub=member.battery_max_charge_kW, name=f"charge_{cid}")
+                values["discharge"] = m.addVars(T, lb=0, ub=member.battery_max_discharge_kW, name=f"discharge_{cid}")
+                values["soc"] = m.addVars(T, lb=0, ub=member.battery_capacity_kWh, name=f"soc_{cid}")
+                for t in T:
+                    previous = member.battery_initial_soc_kWh if t == 0 else values["soc"][t - 1]
+                    m.addConstr(values["soc"][t] == previous
+                                + member.battery_charging_efficiency * values["charge"][t]
+                                - values["discharge"][t] / member.battery_discharging_efficiency,
+                                name=f"soc_balance_{cid}_{t}")
+                m.addConstr(values["soc"][member.n_hours - 1] == member.battery_initial_soc_kWh,
+                            name=f"soc_terminal_{cid}")
+
+            # Adds each member's variables and constraints to the overall dict for the community
+            members[cid] = values
+            private_cost += member.pv_marginal_cost * gp.quicksum(values["pv"][t] for t in T)
+            private_cost += member.linear_disutility * gp.quicksum(
+                values["delta_pos"][t] + values["delta_neg"][t] for t in T)
+
+        # Defines community-level variables for import, export, and excess
+        imp = m.addVars(T, lb=0, name="community_import")
+        exp = m.addVars(T, lb=0, name="community_export")
+        excess = m.addVars(T, lb=0, name="community_excess")
+        self.var = {"members": members, "import": imp, "export": exp, "excess": excess}
+
+        # calculating net import for each member in each hour
+        def net(member, t):
+            values = members[member.consumer_id]
+            expression = values["load"][t] - values["pv"][t]
+            if member.has_battery:
+                expression += values["charge"][t] - values["discharge"][t]
+            return expression
+
+        # Setting-up overall community balance, capacity, and excess import constraints
+        self.con["balance"] = m.addConstrs(
+            (imp[t] - exp[t] == gp.quicksum(net(member, t) for member in d.members) for t in T),
+            name="community_balance")
+        self.con["capacity"] = m.addConstrs(
+            (imp[t] - excess[t] <= float(contract.capacity_limit_kW[t]) for t in T),
+            name="community_capacity")
+        self.con["excess_import"] = m.addConstrs(
+            (excess[t] <= imp[t] for t in T), name="community_excess_import")
+        meter_cost = gp.quicksum( # calculates the total cost for the community
+            first.energy_price[t] * (imp[t] - exp[t])
+            + discounted_import * imp[t] + discounted_export * exp[t]
+            + (alpha - discounted_import) * excess[t] for t in T)
+        m.setObjective(meter_cost + private_cost, GRB.MINIMIZE)
+        m.update()
+        return self
+
+    def solve(self):
+        """Solve the selected formulation and return member or community results."""
+        if self.contract_type != "C":
+            return {member_id: consumer.solve() for member_id, consumer in self.consumers.items()}
+        if self.m is None or not self.var:
+            raise RuntimeError("Community C model must be built before solving.")
+        
+        # Optimizing full community model for the "C" formulation
+        self.m.optimize()
+        status = _status_name(self.m.Status)
+        
+        # Logging status of solver
+        if self.m.Status != GRB.OPTIMAL:
+            raise RuntimeError(f"Community formulation C ended with status {status}.")
+        
+        d, T = self.data, list(range(self.data.members[0].n_hours))
+        contract, first = d.contract, d.members[0]
+        
+        # Creating hourly dataframe for community dispatch variables
+        hourly = pd.DataFrame(index=pd.Index(T, name="hour"))
+        hourly["energy_price"] = first.energy_price
+        hourly["community_import"] = [self.var["import"][t].X for t in T]
+        hourly["community_export"] = [self.var["export"][t].X for t in T]
+        hourly["community_excess"] = [self.var["excess"][t].X for t in T]
+        hourly["capacity"] = contract.capacity_limit_kW
+        hourly["dual_internal_price"] = [self.con["balance"][t].Pi for t in T]
+        hourly["dual_capacity"] = [-self.con["capacity"][t].Pi for t in T]
+        
+        # Adding individual member variables to hourly df
+        for member in d.members:
+            for name, variables in self.var["members"][member.consumer_id].items():
+                hourly[f"{member.consumer_id}_{name}"] = [variables[t].X for t in T]
+        
+        # Calculating total costs using hourly df values
+        energy = first.energy_price * (hourly["community_import"] - hourly["community_export"])
+        tariff = ((1 - contract.tariff_discount_ratio) * first.import_tariff * hourly["community_import"]
+                  + (1 - contract.tariff_discount_ratio) * first.export_tariff * hourly["community_export"])
+        penalty = (contract.penalty_DKK_per_kWh - (1 - contract.tariff_discount_ratio) * first.import_tariff) * hourly["community_excess"]
+        
+        return Results(
+            question="C", status=status, objective=self.m.ObjVal, hourly=hourly,
+            duals={"capacity_rent": float(np.dot(hourly["dual_capacity"], contract.capacity_limit_kW))},
+            meta={"economics": {"energy_cost": float(energy.sum()), "tariff_cost": float(tariff.sum()),
+                                "excess_penalty_cost": float(penalty.sum())}},
+        )
+
 
 class CommunityOptimizationModel:
     """Build and solve a community formulation from shared community data.
 
-    The current repository has member-level equations for the reference and
-    individual-contract cases. Centralized and dynamic-pricing formulations
-    require assignment-specific equations that are not yet represented here.
+    R/I use independent member meters; C uses one joint community meter.
     """
 
-    _SUPPORTED_FORMULATIONS = {"R", "I"}
+    _SUPPORTED_FORMULATIONS = {"R", "I", "C"}
 
     def __init__(
         self,
@@ -446,7 +601,7 @@ class CommunityOptimizationModel:
         self.formulation = formulation.upper()
         self.verbose = verbose
         self.model: Community | None = None
-        self.results: dict[str, Results] | None = None
+        self.results: dict[str, Results] | Results | None = None
         self._validate_community()
 
     def _validate_community(self) -> None:
@@ -474,25 +629,21 @@ class CommunityOptimizationModel:
             contract_type=contract_type,
             verbose=self.verbose,
         )
-        for consumer in self.model.consumers.values():
-            consumer.build()
+        self.model.build()
         self.results = None
         return self
 
-    def solve(self) -> dict[str, Results]:
-        """Solve every member model and return results keyed by member ID."""
+    def solve(self) -> dict[str, Results] | Results:
+        """Solve the selected formulation."""
         if self.model is None:
             self.build_model()
 
         if self.model is None:
             raise RuntimeError("CommunityOptimizationModel failed to build its member models.")
-        self.results = {
-            member_id: consumer.solve()
-            for member_id, consumer in self.model.consumers.items()
-        }
+        self.results = self.model.solve()
         return self.results
 
-    def extract_results(self) -> dict[str, Results]:
+    def extract_results(self) -> dict[str, Results] | Results:
         """Return solved member results without re-solving the models."""
         if self.results is None:
             raise RuntimeError("CommunityOptimizationModel has not been solved yet.")

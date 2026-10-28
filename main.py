@@ -34,6 +34,11 @@ def run_community_case(
     model.build_model()
     results = model.solve()
 
+    if formulation == "C":
+        results.save(out / "community", tag=formulation)
+        print(f"Community:\n{results}\n")
+        return results
+
     for member_id, result in results.items():
         member = community.member(member_id)
         member_out = out / member_id
@@ -83,8 +88,11 @@ def main() -> None:
     try:
         results = run_community_case(com, args.formulation, output_dir, show=args.show)
         
-        # 1. Sum the 'import' column across all members' hourly DataFrames
-        total_import = sum(res.hourly["import"] for res in results.values())
+        # 1. Read the shared meter for C, otherwise sum member meters.
+        if args.formulation == "C":
+            total_import = results.hourly["community_import"]
+        else:
+            total_import = sum(res.hourly["import"] for res in results.values())
         
         # 2. Subtract the DSO feeder capacity limit and clip negative values to 0
         limit = com.contract.capacity_limit_kW

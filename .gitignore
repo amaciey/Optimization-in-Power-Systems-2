@@ -11,3 +11,4 @@ src/model-a1.py
 .vscode/settings.json
 
 results/*
+src/q1_model.py
