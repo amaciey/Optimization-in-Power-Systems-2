@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 from gurobipy import GRB
 
-from .data_loader import CommunityData, InputData
+from .data_loader import CommunityData, ContractData, InputData
 
 
 @dataclass
@@ -182,15 +182,17 @@ class DisutilityConsumer(FlexibleConsumerModel):
         data: InputData,
         name: str = "disutility_consumer",
         verbose: bool = False,
-        contract_type: str = "R"
+        contract_type: str = "R",
+        contract: ContractData = None
     ):
         super().__init__(data=data, name=name, verbose=verbose)
         self.contract_type = contract_type
+        self.contract = contract
     
     def build(self) -> "DisutilityConsumer":
         """Declare decision variables, objective and constraints."""
         super().build()
-        d, m, T = self.data, self.m, self.T
+        d, m, T, con = self.data, self.m, self.T, self.contract
 
         # Auxiliary variables for linear absolute value decomposition: |L_t - ref_t| = delta_pos + delta_neg
         self.var["delta_pos"] = m.addVars(T, lb=-GRB.INFINITY, vtype=GRB.CONTINUOUS, name="delta_pos")
@@ -212,8 +214,39 @@ class DisutilityConsumer(FlexibleConsumerModel):
 
         # --- Objective ---------------------------------------------------------------
         # Minimize total cost: procurement costs + PV costs + linear disutility penalty
-        m.setObjective(
-            gp.quicksum(p_imp[t]*P_imp[t] - p_exp[t]*P_exp[t] + c_pv*PV[t] + c_L*(delta_pos[t] + delta_neg[t]) for t in T), GRB.MINIMIZE)
+        match self.contract_type:
+            case "R":
+                m.setObjective(
+                    gp.quicksum(p_imp[t]*P_imp[t] - p_exp[t]*P_exp[t] + c_pv*PV[t] + c_L*(delta_pos[t] + delta_neg[t]) for t in T), GRB.MINIMIZE)
+            case "I":
+                betaDSO = con.tariff_discount_ratio
+                alphaDSO = con.penalty_DKK_per_kWh
+                
+                P_iDSO = con.individual_capacity_limit_kW[d.consumer_id]
+                
+                # Apply the tariff discount (1 - beta) to the grid tariffs
+                p_imp_I = d.energy_price + (1 - betaDSO) * d.import_tariff
+                p_exp_I = d.energy_price - (1 - betaDSO) * d.export_tariff
+                
+                # Auxiliary variable for imports exceeding the individual cap
+                self.var["exceedance"] = m.addVars(T, lb=0.0, vtype=GRB.CONTINUOUS, name="exceedance")
+                exceedance = self.var["exceedance"]
+                
+                # Link exceedance variable to the import and cap
+                self.con["exceedance_def"] = m.addConstrs(
+                    (exceedance[t] >= P_imp[t] - P_iDSO[t] for t in T), name="exceedance_def"
+                )
+                
+                m.setObjective(
+                    gp.quicksum(
+                        p_imp_I[t] * P_imp[t] - p_exp_I[t] * P_exp[t] 
+                        + c_pv * PV[t] 
+                        + c_L * (delta_pos[t] + delta_neg[t]) 
+                        + alphaDSO * exceedance[t] 
+                        for t in T
+                    ), 
+                    GRB.MINIMIZE
+                )
 
         # --- Constraints -------------------------------------------------------------
         # Linear deviation link: L_t - reference_load_t = delta_pos_t - delta_neg_t
@@ -229,6 +262,39 @@ class DisutilityConsumer(FlexibleConsumerModel):
 
         m.update()
         return self
+
+    def _extract_results(self, status: str) -> Results:
+        # 1. Get the base results from the parent class
+        results = super()._extract_results(status)
+        
+        # 2. If it's an Individual contract, recalculate the economics correctly
+        if self.contract_type == "I" and self.contract:
+            hourly = results.hourly
+            betaDSO = self.contract.tariff_discount_ratio
+            alphaDSO = self.contract.penalty_DKK_per_kWh
+            
+            # Recalculate discounted tariffs
+            p_imp_I = self.data.energy_price + (1 - betaDSO) * self.data.import_tariff
+            p_exp_I = self.data.energy_price - (1 - betaDSO) * self.data.export_tariff
+            
+            # Calculate correct procurement and new penalty costs
+            proc_cost = float((p_imp_I * hourly["import"] - p_exp_I * hourly["export"]).sum())
+            pen_cost = float((alphaDSO * hourly["exceedance"]).sum())
+            
+            # Update the economics dictionary
+            results.meta["economics"]["procurement_cost"] = proc_cost
+            results.meta["economics"]["penalty_cost"] = pen_cost
+            
+            # Fix net utility to subtract the correct costs
+            if "utility" in results.meta["economics"]:
+                results.meta["economics"]["net_utility"] = (
+                    results.meta["economics"]["utility"] 
+                    - proc_cost 
+                    - results.meta["economics"]["pv_cost"] 
+                    - pen_cost
+                )
+                
+        return results
 
 
 class BatteryDisutilityConsumer(DisutilityConsumer):
@@ -348,6 +414,7 @@ class Community:
                 name=f"{data.community}_{member.consumer_id}",
                 verbose=verbose,
                 contract_type=contract_type,
+                contract=data.contract
             )
 
 

@@ -1,0 +1,4 @@
+# Install with:  pip install -r requirements.txt
+gurobipy>=11.0   # solver interface (the pip licence is large enough for these models)
+numpy>=1.26
+pandas>=2.1

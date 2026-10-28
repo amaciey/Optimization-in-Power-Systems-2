@@ -81,7 +81,26 @@ def main() -> None:
         runpy.run_module("src.scenario_generation", run_name="__main__")
 
     try:
-        run_community_case(com, args.formulation, output_dir, show=args.show)
+        results = run_community_case(com, args.formulation, output_dir, show=args.show)
+        
+        # 1. Sum the 'import' column across all members' hourly DataFrames
+        total_import = sum(res.hourly["import"] for res in results.values())
+
+        print(res.hourly["import"] for res in results.values())
+        
+        # 2. Subtract the DSO feeder capacity limit and clip negative values to 0
+        limit = com.contract.capacity_limit_kW
+        congestion = (total_import - limit).clip(lower=0)
+        
+        # 3. Print the congestion metrics
+        print(f"\n--- Congestion Summary ({args.formulation}) ---")
+        print(f"Total import (kWh): {total_import}")
+        print(f"Total daily congestion: {congestion.sum():.2f} kWh")
+        print(f"Number of congested hours: {(congestion > 0).sum()}")
+        print(f"Max hourly congestion: {congestion.max():.2f} kW")
+
+
+        
     except NotImplementedError as exc:
         ap.error(str(exc))
 
