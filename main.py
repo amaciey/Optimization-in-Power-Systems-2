@@ -85,8 +85,6 @@ def main() -> None:
         
         # 1. Sum the 'import' column across all members' hourly DataFrames
         total_import = sum(res.hourly["import"] for res in results.values())
-
-        print(res.hourly["import"] for res in results.values())
         
         # 2. Subtract the DSO feeder capacity limit and clip negative values to 0
         limit = com.contract.capacity_limit_kW
@@ -94,12 +92,10 @@ def main() -> None:
         
         # 3. Print the congestion metrics
         print(f"\n--- Congestion Summary ({args.formulation}) ---")
-        print(f"Total import (kWh): {total_import}")
+        print(f"Total import (kWh): {total_import.sum():.2f}")
         print(f"Total daily congestion: {congestion.sum():.2f} kWh")
         print(f"Number of congested hours: {(congestion > 0).sum()}")
         print(f"Max hourly congestion: {congestion.max():.2f} kW")
-
-
         
     except NotImplementedError as exc:
         ap.error(str(exc))

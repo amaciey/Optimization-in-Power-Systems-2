@@ -90,12 +90,20 @@ class FlexibleConsumerModel:
         self.con["balance"] = m.addConstrs(
             (L[t] + P_exp[t] - PV[t] - P_imp[t] == 0 for t in T), name="balance")
 
-        # 2. Flexible load operational limits: L_min <= L_t <= L_max
+        # 2. Flexible load operational limits, including hourly deviation bounds when provided
+        load_min = d.load_lower_kWh if d.load_lower_kWh is not None else np.full(len(T), d.load_min_kWh)
+        load_max = d.load_upper_kWh if d.load_upper_kWh is not None else np.full(len(T), d.load_max_kWh)
         self.con["load_min"] = m.addConstrs(
-            (d.load_min_kWh - L[t] <= 0 for t in T), name="load_min")
+            (load_min[t] - L[t] <= 0 for t in T), name="load_min")
         
         self.con["load_max"] = m.addConstrs(
-            (L[t] - d.load_max_kWh <= 0 for t in T), name="load_max")
+            (L[t] - load_max[t] <= 0 for t in T), name="load_max")
+
+        if d.min_daily_energy_kWh is not None:
+            self.con["min_daily_energy"] = m.addConstr(
+                gp.quicksum(L[t] for t in T) >= d.min_daily_energy_kWh,
+                name="min_daily_energy",
+            )
 
         # 3. PV operational limits: 0 <= PV_t <= PV_available
         self.con["pv_min"] = m.addConstrs(
