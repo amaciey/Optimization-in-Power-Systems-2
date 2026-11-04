@@ -568,6 +568,16 @@ class Community:
         for member in d.members:
             for name, variables in self.var["members"][member.consumer_id].items():
                 hourly[f"{member.consumer_id}_{name}"] = [variables[t].X for t in T]
+
+        # Alias columns expected by plotting.py
+        hourly["price"] = first.energy_price
+        hourly["import"] = hourly["community_import"]
+        hourly["export"] = hourly["community_export"]
+        hourly["load"] = sum(hourly[f"{m.consumer_id}_load"] for m in d.members)
+        hourly["pv"] = sum(hourly[f"{m.consumer_id}_pv"] for m in d.members)
+        hourly["pv_available"] = sum(m.pv_available for m in d.members)
+        hourly["reference_load"] = sum(m.reference_load for m in d.members)
+        hourly["dual_balance"] = -hourly["dual_internal_price"]
         
         # Calculating total costs using hourly df values
         energy = first.energy_price * (hourly["community_import"] - hourly["community_export"])

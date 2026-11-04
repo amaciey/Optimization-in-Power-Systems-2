@@ -35,7 +35,11 @@ def run_community_case(
     results = model.solve()
 
     if formulation == "C":
-        results.save(out / "community", tag=formulation)
+        comm_out = out / "community"
+        results.save(comm_out, tag=formulation)
+        plot_schedule(results, community.members[0], save_to=comm_out / "schedule.png")
+        plot_duals(results, community.members[0], save_to=comm_out / "duals.png")
+        plot_price_ladder(results, community.members[0], save_to=comm_out / "price_ladder.png")
         print(f"Community:\n{results}\n")
         return results
 
