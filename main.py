@@ -34,13 +34,13 @@ def run_community_case(
     model.build_model()
     results = model.solve()
 
-    if formulation == "C":
+    if formulation in ("C", "DP"):
         comm_out = out / "community"
         results.save(comm_out, tag=formulation)
         plot_schedule(results, community.members[0], save_to=comm_out / "schedule.png")
         plot_duals(results, community.members[0], save_to=comm_out / "duals.png")
         plot_price_ladder(results, community.members[0], save_to=comm_out / "price_ladder.png")
-        print(f"Community:\n{results}\n")
+        print(f"Community ({formulation}):\n{results}\n")
         return results
 
     for member_id, result in results.items():
@@ -92,8 +92,8 @@ def main() -> None:
     try:
         results = run_community_case(com, args.formulation, output_dir, show=args.show)
         
-        # 1. Read the shared meter for C, otherwise sum member meters.
-        if args.formulation == "C":
+        # 1. Read the shared meter for C and DP, otherwise sum member meters.
+        if args.formulation in ("C", "DP"):
             total_import = results.hourly["community_import"]
         else:
             total_import = sum(res.hourly["import"] for res in results.values())
