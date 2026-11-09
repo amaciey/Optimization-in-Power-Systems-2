@@ -618,17 +618,19 @@ class Community:
             return self
 
         # --- 2. Additional Upper/Lower-Level KKT & Settlement Structure for "DP" ---
-        # Safe big-M constants for dual and primal bounds
-        max_price_bound = float(np.max(first.energy_price) + alpha + 5.0)
-        M_dual = 2.0 * max_price_bound
+        # Tight physical bounds on internal price and dual multipliers
+        max_p = float(np.max(first.energy_price) + alpha)
+        min_p = 0.0
+        max_cL = max(float(m_i.linear_disutility) for m_i in d.members)
+        M_dual = max_p + 2.0 * max_cL + 2.0
 
-        # Internal price variable x_t (uniform across members, or discriminated per member if enabled)
-        x_uniform = m.addVars(T, lb=-max_price_bound, ub=max_price_bound, name="internal_price")
+        # Internal price variable x_t
+        x_uniform = m.addVars(T, lb=min_p, ub=max_p, name="internal_price")
         self.var["internal_price"] = x_uniform
         if self.price_discrimination:
             x_member = {
                 member.consumer_id: m.addVars(
-                    T, lb=-max_price_bound, ub=max_price_bound, name=f"internal_price_{member.consumer_id}"
+                    T, lb=min_p, ub=max_p, name=f"internal_price_{member.consumer_id}"
                 )
                 for member in d.members
             }
@@ -652,55 +654,74 @@ class Community:
             E_min = float(member.min_daily_energy_kWh)
             d_max = float(member.max_hourly_deviation_kWh or member.load_max_kWh)
 
-            # Follower dual variables
+            # Follower load & deviation dual variables
             mu_delta = m.addVars(T, lb=-c_L, ub=c_L, name=f"mu_delta_{cid}")
             mu_minus = m.addVars(T, lb=0.0, ub=M_dual, name=f"mu_minus_{cid}")
             mu_plus = m.addVars(T, lb=0.0, ub=M_dual, name=f"mu_plus_{cid}")
             mu_E = m.addVar(lb=0.0, ub=M_dual, name=f"mu_E_{cid}")
-            nu_minus = m.addVars(T, lb=0.0, ub=M_dual, name=f"nu_minus_{cid}")
-            nu_plus = m.addVars(T, lb=0.0, ub=M_dual, name=f"nu_plus_{cid}")
             omega_plus = m.addVars(T, lb=0.0, ub=2.0 * c_L, name=f"omega_plus_{cid}")
             omega_minus = m.addVars(T, lb=0.0, ub=2.0 * c_L, name=f"omega_minus_{cid}")
 
-            # Stationarity conditions
+            # Load & deviation stationarity conditions
             m.addConstrs(
                 (x_i[t] + mu_delta[t] - mu_minus[t] + mu_plus[t] - mu_E == 0.0 for t in T),
                 name=f"stat_load_{cid}",
             )
-            m.addConstrs(
-                (c_pv - x_i[t] - nu_minus[t] + nu_plus[t] == 0.0 for t in T),
-                name=f"stat_pv_{cid}",
-            )
             m.addConstrs((c_L - mu_delta[t] - omega_plus[t] == 0.0 for t in T), name=f"stat_dpos_{cid}")
             m.addConstrs((c_L + mu_delta[t] - omega_minus[t] == 0.0 for t in T), name=f"stat_dneg_{cid}")
 
-            # Complementarity conditions for load, daily energy, PV, and deviations
-            M_E = float(np.sum(L_max) - E_min) + 1e-3
+            # Minimum daily energy complementarity
+            M_E = float(np.sum(L_max) - E_min)
             self._add_complementarity(
                 gp.quicksum(v["load"][t] for t in T) - E_min, mu_E, M_E, M_dual, f"Emin_{cid}"
             )
+
+            # Hourly load bounds & deviation complementarities (with mutual-exclusivity cuts)
             for t in T:
-                span_L = float(L_max[t] - L_min[t]) + 1e-4
-                self._add_complementarity(
+                span_L = float(L_max[t] - L_min[t])
+                u_lmin = self._add_complementarity(
                     v["load"][t] - float(L_min[t]), mu_minus[t], span_L, M_dual, f"Lmin_{cid}_{t}"
                 )
-                self._add_complementarity(
+                u_lmax = self._add_complementarity(
                     float(L_max[t]) - v["load"][t], mu_plus[t], span_L, M_dual, f"Lmax_{cid}_{t}"
                 )
-                self._add_complementarity(
+                if u_lmin is not None and u_lmax is not None and span_L > 1e-6:
+                    m.addConstr(u_lmin + u_lmax <= 1, name=f"mutex_L_{cid}_{t}")
+
+                # Delta_pos and Delta_neg cannot both be strictly positive
+                u_dpos = self._add_complementarity(
                     v["delta_pos"][t], omega_plus[t], d_max, 2.0 * c_L, f"dpos_{cid}_{t}"
                 )
-                self._add_complementarity(
+                u_dneg = self._add_complementarity(
                     v["delta_neg"][t], omega_minus[t], d_max, 2.0 * c_L, f"dneg_{cid}_{t}"
                 )
-                pv_avail = float(member.pv_available[t])
-                if pv_avail > 0:
-                    self._add_complementarity(v["pv"][t], nu_minus[t], pv_avail, M_dual, f"pvmin_{cid}_{t}")
-                    self._add_complementarity(
-                        pv_avail - v["pv"][t], nu_plus[t], pv_avail, M_dual, f"pvmax_{cid}_{t}"
-                    )
-                else:
-                    m.addConstr(nu_plus[t] == 0.0, name=f"nu_plus_zero_{cid}_{t}")
+                if u_dpos is not None and u_dneg is not None:
+                    # At most one of delta_pos > 0 (u_dpos=0) or delta_neg > 0 (u_dneg=0)
+                    m.addConstr(u_dpos + u_dneg >= 1, name=f"mutex_delta_{cid}_{t}")
+
+            # PV KKT conditions ONLY for members with PV and hours with pv_available[t] > 0
+            pv_dual_term = gp.LinExpr()
+            if member.has_pv:
+                nu_minus = {}
+                nu_plus = {}
+                for t in T:
+                    pv_avail = float(member.pv_available[t])
+                    if pv_avail > 1e-6:
+                        nu_minus[t] = m.addVar(lb=0.0, ub=M_dual, name=f"nu_minus_{cid}_{t}")
+                        nu_plus[t] = m.addVar(lb=0.0, ub=M_dual, name=f"nu_plus_{cid}_{t}")
+                        m.addConstr(
+                            c_pv - x_i[t] - nu_minus[t] + nu_plus[t] == 0.0,
+                            name=f"stat_pv_{cid}_{t}",
+                        )
+                        u_pvmin = self._add_complementarity(
+                            v["pv"][t], nu_minus[t], pv_avail, M_dual, f"pvmin_{cid}_{t}"
+                        )
+                        u_pvmax = self._add_complementarity(
+                            pv_avail - v["pv"][t], nu_plus[t], pv_avail, M_dual, f"pvmax_{cid}_{t}"
+                        )
+                        if u_pvmin is not None and u_pvmax is not None:
+                            m.addConstr(u_pvmin + u_pvmax <= 1, name=f"mutex_pv_{cid}_{t}")
+                        pv_dual_term += pv_avail * nu_plus[t]
 
             # Strong-duality objective expression g_i(Phi_i)
             g_i = (
@@ -708,9 +729,9 @@ class Community:
                     -float(L_ref[t]) * mu_delta[t]
                     + float(L_min[t]) * mu_minus[t]
                     - float(L_max[t]) * mu_plus[t]
-                    - float(member.pv_available[t]) * nu_plus[t]
                     for t in T
                 )
+                - pv_dual_term
                 + E_min * mu_E
             )
 
@@ -732,6 +753,11 @@ class Community:
                 psi_min = m.addVars(T, lb=0.0, ub=M_dual, name=f"psi_min_{cid}")
                 psi_max = m.addVars(T, lb=0.0, ub=M_dual, name=f"psi_max_{cid}")
 
+                # At t = 23, soc[23] == E_0 is fixed strictly inside (0, E_cap), so bound duals are 0
+                last_t = member.n_hours - 1
+                m.addConstr(psi_min[last_t] == 0.0, name=f"psi_min_end_{cid}")
+                m.addConstr(psi_max[last_t] == 0.0, name=f"psi_max_end_{cid}")
+
                 m.addConstrs(
                     (x_i[t] - eta_ch * xi[t] - phi_ch_min[t] + phi_ch_max[t] == 0.0 for t in T),
                     name=f"stat_ch_{cid}",
@@ -741,7 +767,7 @@ class Community:
                     name=f"stat_dis_{cid}",
                 )
                 for t in T:
-                    if t < member.n_hours - 1:
+                    if t < last_t:
                         m.addConstr(
                             xi[t] - xi[t + 1] - psi_min[t] + psi_max[t] == 0.0,
                             name=f"stat_soc_{cid}_{t}",
@@ -751,20 +777,32 @@ class Community:
                             xi[t] + xi_end - psi_min[t] + psi_max[t] == 0.0,
                             name=f"stat_soc_{cid}_{t}",
                         )
-                    self._add_complementarity(v["charge"][t], phi_ch_min[t], P_ch, M_dual, f"chmin_{cid}_{t}")
-                    self._add_complementarity(
+                    u_chmin = self._add_complementarity(
+                        v["charge"][t], phi_ch_min[t], P_ch, M_dual, f"chmin_{cid}_{t}"
+                    )
+                    u_chmax = self._add_complementarity(
                         P_ch - v["charge"][t], phi_ch_max[t], P_ch, M_dual, f"chmax_{cid}_{t}"
                     )
-                    self._add_complementarity(
+                    u_dismin = self._add_complementarity(
                         v["discharge"][t], phi_dis_min[t], P_dis, M_dual, f"dismin_{cid}_{t}"
                     )
-                    self._add_complementarity(
+                    u_dismax = self._add_complementarity(
                         P_dis - v["discharge"][t], phi_dis_max[t], P_dis, M_dual, f"dismax_{cid}_{t}"
                     )
-                    self._add_complementarity(v["soc"][t], psi_min[t], E_cap, M_dual, f"socmin_{cid}_{t}")
-                    self._add_complementarity(
-                        E_cap - v["soc"][t], psi_max[t], E_cap, M_dual, f"socmax_{cid}_{t}"
-                    )
+                    if u_chmin is not None and u_chmax is not None:
+                        m.addConstr(u_chmin + u_chmax <= 1, name=f"mutex_ch_{cid}_{t}")
+                    if u_dismin is not None and u_dismax is not None:
+                        m.addConstr(u_dismin + u_dismax <= 1, name=f"mutex_dis_{cid}_{t}")
+
+                    if t < last_t:
+                        u_socmin = self._add_complementarity(
+                            v["soc"][t], psi_min[t], E_cap, M_dual, f"socmin_{cid}_{t}"
+                        )
+                        u_socmax = self._add_complementarity(
+                            E_cap - v["soc"][t], psi_max[t], E_cap, M_dual, f"socmax_{cid}_{t}"
+                        )
+                        if u_socmin is not None and u_socmax is not None:
+                            m.addConstr(u_socmin + u_socmax <= 1, name=f"mutex_soc_{cid}_{t}")
 
                 g_i -= E_0 * (xi[0] + xi_end) + gp.quicksum(
                     P_ch * phi_ch_max[t] + P_dis * phi_dis_max[t] + E_cap * psi_max[t] for t in T
