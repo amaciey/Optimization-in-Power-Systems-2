@@ -1,0 +1,16 @@
+{
+  "data/appliance_params.json": "105622805b47568464ba06c7cb2e45678eda66c3c6c2893d49a00044910fcb28",
+  "data/bus_params.json": "97d3068ab65ed6f61e203c5842020ed2cbbb25eb8d379c8b77883c6127059361",
+  "data/community_base_case.png": "14a8276ada9838406ff58f32825ff4b5b89d690c4ca908f3611b293337d34d5b",
+  "data/community_base_case.svg": "3a7b2666617995bf9d3174d0e0f216e49e5056ef174313714d17804c1b53ed4f",
+  "data/dso_contract_params.json": "fb5af74f3de0fd2511a616d7e5335bfb7e2460ee90312aad2c2cedbc24bb1fc4",
+  "data/fig_q3_scenarios.png": "2051b51bd6658e01a0bc7cd989d015b0a8beba6876be2c5ac2c91df84bda8fb6",
+  "data/fig_q3_scenarios.svg": "fe2000f7888b013edaca53dc4488cb38a52a4078e10dc479e7e324fac416a87a",
+  "data/params_community_base.json": "8c519a59bf583fe4b0ca0a82963693b99b9cc4247039fef89bdaa64bc6c95b16",
+  "data/preference_uncertainty_params.json": "f8cd95e8d0e07541d082905421977a66220a97e17e2e12ec33cb01563c5fd9a9",
+  "data/setup_I.png": "fe97bc50f97d1283ef6630011a8895dd67a947f968eb502c987295e68020c55d",
+  "data/setup_I.svg": "7a98b8ee7f97acfbc9aab2515bf164fecedf6a8fd59cc57550d4488482b6e1af",
+  "data/setup_R.png": "91ead053dbab77213610bff8b06a91e61fe92e1d531028957cfe7e36d8c154d7",
+  "data/setup_R.svg": "bfeaace56d03ae7c61c23d419e50afc2bc6b95cbd508b0d9833289183dd5d79d",
+  "data/weekly_profiles.json": "dbec191fb7c24b00e94e514f73abffa2b5618d83c846c7b9c96e5a5fecb7e1dd"
+}

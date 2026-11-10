@@ -1,14 +1,4 @@
-.DS_Store   
-
+.venv/
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
-.Python
-venv/
-env/   
-src/model-a1.py
-.vscode/settings.json
-
-results/*
-src/q1_model.py
+# Keep results tracked: they are part of this reproducible Q1 deliverable.
