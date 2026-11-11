@@ -995,25 +995,35 @@ class CommunityOptimizationModel:
         verbose: bool = False,
         **kwargs,
     ):
+        # Store the input configuration and normalize formulation names so
+        # callers can use either lowercase or uppercase identifiers.
         self.community = community
         self.formulation = formulation.upper()
         self.verbose = verbose
-        self.kwargs = kwargs
+
+        # The underlying model and its results are created lazily by solve()
+        # and remain unset until the corresponding workflow step completes.
         self.model: Community | None = None
         self.results: dict[str, Results] | Results | None = None
+
+        # Reject invalid community data before constructing any solver model.
         self._validate_community()
 
     def _validate_community(self) -> None:
         """Validate dimensions shared by every member model."""
+        # A community must contain at least one member and one time period.
         if not self.community.members:
             raise ValueError("CommunityOptimizationModel requires at least one member.")
 
         n_hours = self.community.members[0].n_hours
         if n_hours == 0:
             raise ValueError("Community members must contain at least one time period.")
+
+        # All members participate in the same hourly optimization horizon.
         if any(member.n_hours != n_hours for member in self.community.members):
             raise ValueError("All community members must use the same time horizon.")
 
+        # Only the formulations implemented by Community are accepted.
         if self.formulation not in self._SUPPORTED_FORMULATIONS:
             raise NotImplementedError(
                 f"Formulation {self.formulation!r} is not implemented; "
@@ -1022,6 +1032,9 @@ class CommunityOptimizationModel:
 
     def build_model(self) -> "CommunityOptimizationModel":
         """Construct fresh member models for the selected formulation."""
+        # Build a new underlying Community model so repeated calls start from
+        # a clean formulation rather than reusing a solved model.
+        contract_type = self.formulation
         self.model = Community(
             data=self.community,
             contract_type=self.formulation,
@@ -1029,21 +1042,28 @@ class CommunityOptimizationModel:
             **self.kwargs,
         )
         self.model.build()
+
+        # Building invalidates any results from a previous model instance.
         self.results = None
         return self
 
     def solve(self) -> dict[str, Results] | Results:
         """Solve the selected formulation."""
+        # Construct the model on first use, keeping the public workflow lazy.
         if self.model is None:
             self.build_model()
 
         if self.model is None:
             raise RuntimeError("CommunityOptimizationModel failed to build its member models.")
+
+        # Delegate optimization and result extraction to the formulation-specific
+        # Community implementation, then cache the returned results.
         self.results = self.model.solve()
         return self.results
 
     def extract_results(self) -> dict[str, Results] | Results:
         """Return solved member results without re-solving the models."""
+        # Results are only available after a successful solve().
         if self.results is None:
             raise RuntimeError("CommunityOptimizationModel has not been solved yet.")
         return self.results
