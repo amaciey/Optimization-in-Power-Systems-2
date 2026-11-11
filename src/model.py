@@ -250,7 +250,7 @@ class DisutilityConsumer(FlexibleConsumerModel):
                         p_imp_I[t] * P_imp[t] - p_exp_I[t] * P_exp[t] 
                         + c_pv * PV[t] 
                         + c_L * (delta_pos[t] + delta_neg[t]) 
-                        + alphaDSO * exceedance[t] 
+                        + (alphaDSO - (1 - betaDSO) * d.import_tariff) * exceedance[t]
                         for t in T
                     ), 
                     GRB.MINIMIZE
@@ -282,11 +282,11 @@ class DisutilityConsumer(FlexibleConsumerModel):
             alphaDSO = self.contract.penalty_DKK_per_kWh
             
             # Recalculate discounted tariffs
-            p_imp_I = self.data.energy_price + (1 - betaDSO) * self.data.import_tariff
-            p_exp_I = self.data.energy_price - (1 - betaDSO) * self.data.export_tariff
-            
             # Calculate correct procurement and new penalty costs
-            proc_cost = float((p_imp_I * hourly["import"] - p_exp_I * hourly["export"]).sum())
+            billed_import = hourly["import"] - hourly["exceedance"]
+            proc_cost = float((self.data.energy_price * (hourly["import"] - hourly["export"])
+                               + (1 - betaDSO) * self.data.import_tariff * billed_import
+                               + (1 - betaDSO) * self.data.export_tariff * hourly["export"]).sum())
             pen_cost = float((alphaDSO * hourly["exceedance"]).sum())
             
             # Update the economics dictionary
