@@ -106,7 +106,7 @@ def main() -> None:
         print(f"\n--- Congestion Summary ({args.formulation}) ---")
         print(f"Total import (kWh): {total_import.sum():.2f}")
         print(f"Total daily congestion: {congestion.sum():.2f} kWh")
-        print(f"Number of congested hours: {(congestion > 0).sum()}")
+        print(f"Number of congested hours: {(congestion > 1e-3).sum()}")
         print(f"Max hourly congestion: {congestion.max():.2f} kW")
         
     except NotImplementedError as exc:

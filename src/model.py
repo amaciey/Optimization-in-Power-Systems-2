@@ -1000,6 +1000,7 @@ class CommunityOptimizationModel:
         self.community = community
         self.formulation = formulation.upper()
         self.verbose = verbose
+        self.kwargs = kwargs
 
         # The underlying model and its results are created lazily by solve()
         # and remain unset until the corresponding workflow step completes.
