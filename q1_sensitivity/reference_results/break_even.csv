@@ -1,5 +1,0 @@
-dimension,model,status,lower,upper
-beta,I,not_beneficial_in_interval,0.0,0.95
-beta,C,bracketed,0.483697509765625,0.48381347656249996
-cap_scale,I,bracketed,1.4210205078125,1.42138671875
-cap_scale,C,bracketed,0.875732421875,0.8760986328125
