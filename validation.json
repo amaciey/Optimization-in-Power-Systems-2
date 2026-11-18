@@ -1,0 +1,17 @@
+{
+  "contract_configurations": 124,
+  "all_passed": true,
+  "max_checks": {
+    "primal_max_violation": 2.842170943040401e-14,
+    "dual_sign_max_violation": 8.881784197001252e-16,
+    "stationarity_max_residual": 3.552713678800501e-15,
+    "complementarity_max_residual": 7.409184377138445e-14,
+    "strong_duality_absolute_gap_DKK": 7.73070496506989e-12,
+    "objective_reconstruction_error_DKK": 2.8421709430404007e-13,
+    "aggregate_balance_max_error_kWh": 2.1316282072803006e-14,
+    "max_simultaneous_battery_charge_discharge_kWh": 0,
+    "max_simultaneous_meter_import_export_kWh": 0,
+    "max_daily_energy_excess_kWh": 7.105427357601002e-15,
+    "settlement_cap_rent_identity_error_DKK": 4.547473508864641e-13
+  }
+}
