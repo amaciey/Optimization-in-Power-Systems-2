@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 from gurobipy import GRB
 
-from .data_loader import CommunityData, ContractData, InputData
+from .data_loader import CommunityData, ContractData, InputData, apply_scenario_to_community
 
 
 @dataclass
@@ -42,6 +42,44 @@ class Results:
             f"status: {self.status} | objective: {self.objective:.2f} DKK\n"
             f"daily totals (kWh): " + ", ".join(f"{c}={self.hourly[c].sum():.1f}" for c in cols if c in ("import", "export", "load", "pv"))
             + (f"\nduals: {self.duals}" if self.duals else "")
+        )
+
+
+@dataclass
+class StochasticResults:
+    """Solution of an SDP extensive-form model.
+
+    The common price decision is in ``hourly``; scenario-specific recourse is
+    retained both in ``hourly`` and in ``scenario_results``.
+    """
+
+    question: str
+    status: str
+    objective: float
+    hourly: pd.DataFrame
+    scenario_results: dict[str, dict]
+    scenario_probabilities: dict[str, float] = field(default_factory=dict)
+    duals: dict[str, float] = field(default_factory=dict)
+    meta: dict = field(default_factory=dict)
+
+    def save(self, folder: Path | str, tag: str = "") -> None:
+        folder = Path(folder)
+        folder.mkdir(parents=True, exist_ok=True)
+        stem = f"{self.question}{'_' + tag if tag else ''}"
+        self.hourly.to_csv(folder / f"{stem}_hourly.csv", index_label="hour")
+        with open(folder / f"{stem}_summary.txt", "w", encoding="utf-8") as f:
+            f.write(f"status    : {self.status}\nobjective : {self.objective:.4f} DKK\n")
+            f.write(f"risk      : {self.meta.get('risk', {}).get('formulation', 'risk_neutral')}\n")
+            for k, v in self.meta.get("economics", {}).items():
+                f.write(f"{k:<32}: {v:.4f} DKK\n")
+            for k, v in self.scenario_probabilities.items():
+                f.write(f"probability[{k}] : {v:.6f}\n")
+
+    def __str__(self) -> str:
+        risk = self.meta.get("risk", {}).get("formulation", "risk_neutral")
+        return (
+            f"status: {self.status} | objective: {self.objective:.2f} DKK | risk: {risk}\n"
+            f"scenarios: {len(self.scenario_results)}"
         )
 
 
@@ -418,7 +456,18 @@ class Community:
         use_sos1: bool = False,
         time_limit: float = 60.0,
         mip_gap: float = 1e-3,
+        scenarios: list[dict] | None = None,
+        stochastic_constraints: dict | None = None,
     ):
+        """Configure a community formulation.
+
+        For SDP, pass joint appliance scenarios and optionally set
+        ``risk_formulation`` (``risk_neutral``, ``cvar``, or ``chance``),
+        ``risk_alpha``, ``risk_aversion``, and ``chance_probability`` in
+        ``stochastic_constraints``. Enable chance-protected budget balance
+        or individual rationality with their corresponding arguments.
+        Scenario probabilities are normalized when the model is built.
+        """
         self.data = data
         self.contract_type = contract_type.upper()
         self.verbose = verbose
@@ -429,14 +478,26 @@ class Community:
         self.slack_penalty = slack_penalty
         self.price_discrimination = price_discrimination
         self.use_sos1 = use_sos1
+        self.scenarios = scenarios
+        self.stochastic_constraints = dict(stochastic_constraints or {})
+        allowed_settings = {"risk_formulation", "risk_alpha", "risk_aversion", "chance_probability"}
+        unknown_settings = self.stochastic_constraints.keys() - allowed_settings
+        if unknown_settings:
+            raise ValueError(f"Unknown stochastic constraint settings: {sorted(unknown_settings)}")
+        self.risk_formulation = str(self.stochastic_constraints.get("risk_formulation", "risk_neutral")).lower()
+        self.risk_alpha = float(self.stochastic_constraints.get("risk_alpha", 0.95))
+        self.risk_aversion = float(self.stochastic_constraints.get("risk_aversion", 1.0))
+        self.chance_probability = float(self.stochastic_constraints.get("chance_probability", 0.95))
 
         self.consumers: dict[str, DisutilityConsumer | BatteryDisutilityConsumer] = {}
         self.m: gp.Model | None = None
         self.var = {}
         self.con = {}
 
-        # Using a single joint Gurobi model for both "C" and "DP"
-        if self.contract_type in ("C", "DP"):
+        # Using a single joint Gurobi model for C, DP, and SDP.
+        if self.contract_type in ("C", "DP", "SDP"):
+            if self.contract_type == "SDP" and not self.scenarios:
+                raise ValueError("SDP requires at least one joint scenario")
             self.m = gp.Model(f"{data.community}_{self.contract_type}")
             self.m.Params.OutputFlag = int(verbose)
             if self.contract_type == "C":
@@ -490,8 +551,357 @@ class Community:
         m.addConstr(dual_var <= M_dual * u, name=f"comp_d_{name}")
         return u
 
+    def _normalize_scenarios(self) -> list[tuple[str, float, CommunityData]]:
+        """Adapt scenarios and normalize their finite, nonnegative probabilities."""
+        if not self.scenarios:
+            raise ValueError("SDP requires at least one joint scenario")
+
+        normalized = []
+        supplied = []
+
+        for i, scenario in enumerate(self.scenarios):
+            if not isinstance(scenario, dict):
+                raise TypeError(f"scenario {i} must be a dictionary")
+            probability = scenario.get("probability")
+            supplied.append(1.0 if probability is None else float(probability))
+
+        if any(not np.isfinite(p) or p < 0 for p in supplied):
+            raise ValueError("scenario probabilities must be finite and nonnegative")
+        total = float(sum(supplied))
+
+        if total <= 0:
+            raise ValueError("scenario probabilities must have a positive sum")
+
+        for i, (scenario, probability) in enumerate(zip(self.scenarios, supplied)):
+            sid = str(scenario.get("id", i))
+            if any(existing_sid == sid for existing_sid, _, _ in normalized):
+                raise ValueError(f"duplicate scenario id: {sid!r}")
+            scenario_data = apply_scenario_to_community(self.data, scenario)
+            normalized.append((sid, probability / total, scenario_data))
+
+        return normalized
+
+    def _add_sdp_follower_kkt(
+        self,
+        sid: str,
+        member: InputData,
+        v: dict,
+        x_i,
+        T,
+        M_dual: float,
+    ):
+        """Add one scenario/member follower KKT system, mirroring the DP derivation."""
+        m = self.m
+        assert m is not None
+        cid = member.consumer_id
+        if member.linear_disutility is None:
+            raise ValueError(f"SDP requires linear_disutility for member {cid}")
+
+        c_L = float(member.linear_disutility)
+        c_pv = float(member.pv_marginal_cost)
+
+        L_min = member.load_lower_kWh
+        L_max = member.load_upper_kWh
+        L_ref = member.reference_load
+
+        E_min = float(member.min_daily_energy_kWh)
+        d_max = float(member.max_hourly_deviation_kWh or member.load_max_kWh)
+        tag = f"{sid}_{cid}"
+
+        mu_delta = m.addVars(T, lb=-c_L, ub=c_L, name=f"mu_delta_{tag}")
+        mu_minus = m.addVars(T, lb=0.0, ub=M_dual, name=f"mu_minus_{tag}")
+        mu_plus = m.addVars(T, lb=0.0, ub=M_dual, name=f"mu_plus_{tag}")
+        mu_E = m.addVar(lb=0.0, ub=M_dual, name=f"mu_E_{tag}")
+        omega_plus = m.addVars(T, lb=0.0, ub=2.0 * c_L, name=f"omega_plus_{tag}")
+        omega_minus = m.addVars(T, lb=0.0, ub=2.0 * c_L, name=f"omega_minus_{tag}")
+
+        m.addConstrs((x_i[t] + mu_delta[t] - mu_minus[t] + mu_plus[t] - mu_E == 0.0 for t in T), name=f"stat_load_{tag}")
+        m.addConstrs((c_L - mu_delta[t] - omega_plus[t] == 0.0 for t in T), name=f"stat_dpos_{tag}")
+        m.addConstrs((c_L + mu_delta[t] - omega_minus[t] == 0.0 for t in T), name=f"stat_dneg_{tag}")
+
+        M_E = max(0.0, float(np.sum(L_max) - E_min))
+        self._add_complementarity(gp.quicksum(v["load"][t] for t in T) - E_min, mu_E, M_E, M_dual, f"Emin_{tag}")
+
+        for t in T:
+            span_L = float(L_max[t] - L_min[t])
+            u_lmin = self._add_complementarity(v["load"][t] - float(L_min[t]), mu_minus[t], span_L, M_dual, f"Lmin_{tag}_{t}")
+            u_lmax = self._add_complementarity(float(L_max[t]) - v["load"][t], mu_plus[t], span_L, M_dual, f"Lmax_{tag}_{t}")
+            if u_lmin is not None and u_lmax is not None and span_L > 1e-6:
+                m.addConstr(u_lmin + u_lmax <= 1, name=f"mutex_L_{tag}_{t}")
+            u_dpos = self._add_complementarity(v["delta_pos"][t], omega_plus[t], d_max, 2.0 * c_L, f"dpos_{tag}_{t}")
+            u_dneg = self._add_complementarity(v["delta_neg"][t], omega_minus[t], d_max, 2.0 * c_L, f"dneg_{tag}_{t}")
+            if u_dpos is not None and u_dneg is not None:
+                m.addConstr(u_dpos + u_dneg >= 1, name=f"mutex_delta_{tag}_{t}")
+
+        pv_dual_term = gp.LinExpr()
+        if member.has_pv:
+            nu_minus, nu_plus = {}, {}
+            for t in T:
+                pv_avail = float(member.pv_available[t])
+                if pv_avail > 1e-6:
+                    nu_minus[t] = m.addVar(lb=0.0, ub=M_dual, name=f"nu_minus_{tag}_{t}")
+                    nu_plus[t] = m.addVar(lb=0.0, ub=M_dual, name=f"nu_plus_{tag}_{t}")
+                    m.addConstr(c_pv - x_i[t] - nu_minus[t] + nu_plus[t] == 0.0, name=f"stat_pv_{tag}_{t}")
+                    u_pvmin = self._add_complementarity(v["pv"][t], nu_minus[t], pv_avail, M_dual, f"pvmin_{tag}_{t}")
+                    u_pvmax = self._add_complementarity(pv_avail - v["pv"][t], nu_plus[t], pv_avail, M_dual, f"pvmax_{tag}_{t}")
+                    if u_pvmin is not None and u_pvmax is not None:
+                        m.addConstr(u_pvmin + u_pvmax <= 1, name=f"mutex_pv_{tag}_{t}")
+                    pv_dual_term += pv_avail * nu_plus[t]
+
+        g_i = (
+            gp.quicksum(-float(L_ref[t]) * mu_delta[t] + float(L_min[t]) * mu_minus[t] - float(L_max[t]) * mu_plus[t] for t in T)
+            - pv_dual_term + E_min * mu_E
+        )
+
+        if member.has_battery:
+            E_cap = float(member.battery_capacity_kWh)
+            P_ch = float(member.battery_max_charge_kW)
+            P_dis = float(member.battery_max_discharge_kW)
+            eta_ch = float(member.battery_charging_efficiency)
+            eta_dis = float(member.battery_discharging_efficiency)
+            E_0 = float(member.battery_initial_soc_kWh)
+
+            xi = m.addVars(T, lb=-M_dual, ub=M_dual, name=f"xi_{tag}")
+            xi_end = m.addVar(lb=-M_dual, ub=M_dual, name=f"xi_end_{tag}")
+            phi_ch_min = m.addVars(T, lb=0.0, ub=M_dual, name=f"phi_ch_min_{tag}")
+            phi_ch_max = m.addVars(T, lb=0.0, ub=M_dual, name=f"phi_ch_max_{tag}")
+            phi_dis_min = m.addVars(T, lb=0.0, ub=M_dual, name=f"phi_dis_min_{tag}")
+            phi_dis_max = m.addVars(T, lb=0.0, ub=M_dual, name=f"phi_dis_max_{tag}")
+            psi_min = m.addVars(T, lb=0.0, ub=M_dual, name=f"psi_min_{tag}")
+            psi_max = m.addVars(T, lb=0.0, ub=M_dual, name=f"psi_max_{tag}")
+            last_t = member.n_hours - 1
+
+            m.addConstr(psi_min[last_t] == 0.0, name=f"psi_min_end_{tag}")
+            m.addConstr(psi_max[last_t] == 0.0, name=f"psi_max_end_{tag}")
+            m.addConstrs((x_i[t] - eta_ch * xi[t] - phi_ch_min[t] + phi_ch_max[t] == 0.0 for t in T), name=f"stat_ch_{tag}")
+            m.addConstrs((-x_i[t] + (1.0 / eta_dis) * xi[t] - phi_dis_min[t] + phi_dis_max[t] == 0.0 for t in T), name=f"stat_dis_{tag}")
+
+            for t in T:
+                if t < last_t:
+                    m.addConstr(xi[t] - xi[t + 1] - psi_min[t] + psi_max[t] == 0.0, name=f"stat_soc_{tag}_{t}")
+                else:
+                    m.addConstr(xi[t] + xi_end - psi_min[t] + psi_max[t] == 0.0, name=f"stat_soc_{tag}_{t}")
+                u_chmin = self._add_complementarity(v["charge"][t], phi_ch_min[t], P_ch, M_dual, f"chmin_{tag}_{t}")
+                u_chmax = self._add_complementarity(P_ch - v["charge"][t], phi_ch_max[t], P_ch, M_dual, f"chmax_{tag}_{t}")
+                u_dismin = self._add_complementarity(v["discharge"][t], phi_dis_min[t], P_dis, M_dual, f"dismin_{tag}_{t}")
+                u_dismax = self._add_complementarity(P_dis - v["discharge"][t], phi_dis_max[t], P_dis, M_dual, f"dismax_{tag}_{t}")
+                if u_chmin is not None and u_chmax is not None:
+                    m.addConstr(u_chmin + u_chmax <= 1, name=f"mutex_ch_{tag}_{t}")
+                if u_dismin is not None and u_dismax is not None:
+                    m.addConstr(u_dismin + u_dismax <= 1, name=f"mutex_dis_{tag}_{t}")
+                if t < last_t:
+                    u_socmin = self._add_complementarity(v["soc"][t], psi_min[t], E_cap, M_dual, f"socmin_{tag}_{t}")
+                    u_socmax = self._add_complementarity(E_cap - v["soc"][t], psi_max[t], E_cap, M_dual, f"socmax_{tag}_{t}")
+                    if u_socmin is not None and u_socmax is not None:
+                        m.addConstr(u_socmin + u_socmax <= 1, name=f"mutex_soc_{tag}_{t}")
+
+            g_i -= E_0 * (xi[0] + xi_end) + gp.quicksum(
+                P_ch * phi_ch_max[t] + P_dis * phi_dis_max[t] + E_cap * psi_max[t] for t in T
+            )
+
+        private_cost = c_pv * gp.quicksum(v["pv"][t] for t in T) + c_L * gp.quicksum(v["delta_pos"][t] + v["delta_neg"][t] for t in T)
+        return g_i, private_cost
+
+    def _build_stochastic_dp(self) -> "Community":
+        """Build the risk-neutral or risk-adjusted extensive-form SDP model."""
+        if self.m is None:
+            raise RuntimeError("SDP model was not initialized")
+        if not 0.0 <= self.risk_alpha < 1.0:
+            raise ValueError("risk_alpha must be in [0, 1)")
+        if not 0.0 <= self.risk_aversion <= 1.0:
+            raise ValueError("risk_aversion must be in [0, 1]")
+        if not 0.0 <= self.chance_probability <= 1.0:
+            raise ValueError("chance_probability must be in [0, 1]")
+        if self.risk_formulation not in ("risk_neutral", "cvar", "chance"):
+            raise ValueError("risk formulation must be risk_neutral, cvar, or chance")
+        if self.risk_formulation == "chance" and not (self.budget_balance or self.individual_rationality):
+            raise ValueError("chance risk requires budget_balance and/or individual_rationality")
+
+        normalized = self._normalize_scenarios()
+        m = self.m
+        T = range(self.data.members[0].n_hours)
+        max_p = max(float(np.max(ds.members[0].energy_price) + ds.contract.penalty_DKK_per_kWh) for _, _, ds in normalized)
+        min_p = 0.0
+        if any(member.linear_disutility is None for _, _, ds in normalized for member in ds.members):
+            raise ValueError("SDP requires linear_disutility for every member in every scenario")
+        max_cL = max(float(member.linear_disutility) for _, _, ds in normalized for member in ds.members)
+        M_dual = max_p + 2.0 * max_cL + 2.0
+
+        x_uniform = m.addVars(T, lb=min_p, ub=max_p, name="internal_price")
+        self.var = {"internal_price": x_uniform, "scenarios": {}}
+        if self.price_discrimination:
+            x_member = {
+                member.consumer_id: m.addVars(T, lb=min_p, ub=max_p, name=f"internal_price_{member.consumer_id}")
+                for member in self.data.members
+            }
+            self.var["member_internal_price"] = x_member
+        else:
+            x_member = {member.consumer_id: x_uniform for member in self.data.members}
+
+        scenario_data = {}
+        meter_costs = {}
+        private_costs = {}
+        dual_objs = {}
+        member_priv_costs = {}
+        probability_by_sid = {sid: probability for sid, probability, _ in normalized}
+
+        for sid, probability, ds in normalized:
+            contract = ds.contract
+            beta = contract.tariff_discount_ratio
+            alpha = contract.penalty_DKK_per_kWh
+            first = ds.members[0]
+            discounted_import = (1 - beta) * first.import_tariff
+            discounted_export = (1 - beta) * first.export_tariff
+            if contract.export_capacity_limit_kW is not None:
+                raise ValueError("SDP does not support an export capacity limit")
+            if alpha < discounted_import:
+                raise ValueError("SDP requires alpha to be at least the discounted import tariff")
+
+            members = {}
+            private_cost = gp.LinExpr()
+            for member in ds.members:
+                if member.quadratic_disutility not in (None, 0) or member.consumption_utility not in (None, 0):
+                    raise ValueError("SDP supports the supplied linear-disutility load only")
+                cid = member.consumer_id
+                values = {
+                    "load": m.addVars(T, lb={t: float(member.load_lower_kWh[t]) for t in T}, ub={t: float(member.load_upper_kWh[t]) for t in T}, name=f"load_{sid}_{cid}"),
+                    "pv": m.addVars(T, lb=0.0, ub={t: float(member.pv_available[t]) for t in T}, name=f"pv_{sid}_{cid}"),
+                    "delta_pos": m.addVars(T, lb=0.0, name=f"delta_pos_{sid}_{cid}"),
+                    "delta_neg": m.addVars(T, lb=0.0, name=f"delta_neg_{sid}_{cid}"),
+                }
+                m.addConstrs((values["load"][t] - float(member.reference_load[t]) == values["delta_pos"][t] - values["delta_neg"][t] for t in T), name=f"deviation_{sid}_{cid}")
+                m.addConstr(gp.quicksum(values["load"][t] for t in T) >= float(member.min_daily_energy_kWh), name=f"min_daily_energy_{sid}_{cid}")
+
+                if member.has_battery:
+                    values["charge"] = m.addVars(T, lb=0.0, ub=float(member.battery_max_charge_kW), name=f"charge_{sid}_{cid}")
+                    values["discharge"] = m.addVars(T, lb=0.0, ub=float(member.battery_max_discharge_kW), name=f"discharge_{sid}_{cid}")
+                    values["soc"] = m.addVars(T, lb=0.0, ub=float(member.battery_capacity_kWh), name=f"soc_{sid}_{cid}")
+                    for t in T:
+                        previous = float(member.battery_initial_soc_kWh) if t == 0 else values["soc"][t - 1]
+                        m.addConstr(values["soc"][t] == previous + float(member.battery_charging_efficiency) * values["charge"][t] - values["discharge"][t] / float(member.battery_discharging_efficiency), name=f"soc_balance_{sid}_{cid}_{t}")
+                    m.addConstr(values["soc"][member.n_hours - 1] == float(member.battery_initial_soc_kWh), name=f"soc_terminal_{sid}_{cid}")
+
+                members[cid] = values
+                private_cost += float(member.pv_marginal_cost) * gp.quicksum(values["pv"][t] for t in T)
+                private_cost += float(member.linear_disutility) * gp.quicksum(values["delta_pos"][t] + values["delta_neg"][t] for t in T)
+
+            imp = m.addVars(T, lb=0.0, name=f"community_import_{sid}")
+            exp = m.addVars(T, lb=0.0, name=f"community_export_{sid}")
+            excess = m.addVars(T, lb=0.0, name=f"community_excess_{sid}")
+
+            def net(member, t):
+                v = members[member.consumer_id]
+                expr = v["load"][t] - v["pv"][t]
+                if member.has_battery:
+                    expr += v["charge"][t] - v["discharge"][t]
+                return expr
+
+            m.addConstrs((imp[t] - exp[t] == gp.quicksum(net(member, t) for member in ds.members) for t in T), name=f"community_balance_{sid}")
+            m.addConstrs((imp[t] - excess[t] <= float(contract.capacity_limit_kW[t]) for t in T), name=f"community_capacity_{sid}")
+            m.addConstrs((excess[t] <= imp[t] for t in T), name=f"community_excess_import_{sid}")
+
+            meter_cost = gp.quicksum(
+                float(first.energy_price[t]) * (imp[t] - exp[t])
+                + discounted_import * imp[t] + discounted_export * exp[t]
+                + (alpha - discounted_import) * excess[t]
+                for t in T
+            )
+
+            dual_objs[sid] = {}
+            member_priv_costs[sid] = {}
+            for member in ds.members:
+                cid = member.consumer_id
+                g_i, priv_cost = self._add_sdp_follower_kkt(sid, member, members[cid], x_member[cid], T, M_dual)
+                dual_objs[sid][cid] = g_i
+                member_priv_costs[sid][cid] = priv_cost
+
+            scenario_data[sid] = ds
+            meter_costs[sid] = meter_cost
+            private_costs[sid] = private_cost
+            self.var["scenarios"][sid] = {"probability": probability, "members": members, "import": imp, "export": exp, "excess": excess}
+
+        expected_meter = gp.LinExpr()
+        expected_private = gp.LinExpr()
+        for sid, probability, _ in normalized:
+            expected_meter += probability * meter_costs[sid]
+            expected_private += probability * private_costs[sid]
+        expected_cost = expected_meter + expected_private
+
+        # Expected budget balance and individual rationality structural constraints.
+        if self.budget_balance:
+            if self.risk_formulation == "chance":
+                z = m.addVars([sid for sid, _, _ in normalized], vtype=GRB.BINARY, name="bb_satisfied")
+                for sid, probability, ds in normalized:
+                    payments = gp.quicksum(dual_objs[sid][cid] - member_priv_costs[sid][cid] for cid in ds.member_ids)
+                    m.addGenConstrIndicator(
+                        z[sid], True, meter_costs[sid] - payments, GRB.EQUAL, 0.0,
+                        name=f"chance_budget_balance_{sid}",
+                    )
+                m.addConstr(
+                    gp.quicksum(probability_by_sid[sid] * z[sid] for sid, _, _ in normalized)
+                    >= self.chance_probability,
+                    name="chance_budget_probability",
+                )
+            else:
+                expected_payments = gp.LinExpr()
+                for sid, probability, ds in normalized:
+                    expected_payments += probability * gp.quicksum(dual_objs[sid][cid] - member_priv_costs[sid][cid] for cid in ds.member_ids)
+                m.addConstr(expected_payments == expected_meter, name="expected_budget_balance")
+
+        if self.individual_rationality:
+            benchmarks = {}
+            for sid, _, ds in normalized:
+                bench_comm = Community(data=ds, contract_type=(self.ir_benchmark if self.ir_benchmark in ("R", "I") else "I"), verbose=False)
+                bench_comm.build()
+                bench_res = bench_comm.solve()
+                benchmarks[sid] = {cid: float(res.objective) for cid, res in bench_res.items()}
+            if self.risk_formulation == "chance":
+                for cid in self.data.member_ids:
+                    z_ir = m.addVars([sid for sid, _, _ in normalized], vtype=GRB.BINARY, name=f"ir_satisfied_{cid}")
+                    for sid, probability, ds in normalized:
+                        violation = dual_objs[sid][cid] - benchmarks[sid][cid]
+                        m.addGenConstrIndicator(
+                            z_ir[sid], True, violation, GRB.LESS_EQUAL, 0.0,
+                            name=f"chance_ir_{sid}_{cid}",
+                        )
+                    m.addConstr(
+                        gp.quicksum(probability_by_sid[sid] * z_ir[sid] for sid, _, _ in normalized)
+                        >= self.chance_probability,
+                        name=f"chance_ir_probability_{cid}",
+                    )
+            else:
+                for cid in self.data.member_ids:
+                    expected_ir = gp.LinExpr()
+                    for sid, probability, ds in normalized:
+                        expected_ir += probability * (dual_objs[sid][cid] - benchmarks[sid][cid])
+                    m.addConstr(expected_ir <= 0.0, name=f"expected_ir_{cid}")
+
+        objective = expected_cost
+        if self.risk_formulation == "cvar":
+            eta = m.addVar(lb=-GRB.INFINITY, name="cvar_threshold")
+            z = m.addVars([sid for sid, _, _ in normalized], lb=0.0, name="cvar_excess")
+            for sid, probability, ds in normalized:
+                scenario_cost = meter_costs[sid] + private_costs[sid]
+                m.addConstr(z[sid] >= scenario_cost - eta, name=f"cvar_excess_{sid}")
+            cvar = eta + gp.quicksum(dict((s, p) for s, p, _ in normalized)[sid] * z[sid] for sid, _, _ in normalized) / (1.0 - self.risk_alpha)
+            objective = (1.0 - self.risk_aversion) * expected_cost + self.risk_aversion * cvar
+            self.var["cvar_threshold"] = eta
+            self.var["cvar_excess"] = z
+
+        m.setObjective(objective, GRB.MINIMIZE)
+        m.update()
+        self.scenario_data = scenario_data
+        self.scenario_probabilities = dict((sid, p) for sid, p, _ in normalized)
+        self.meter_costs = meter_costs
+        self.private_costs = private_costs
+        self.dual_objs = dual_objs
+        self.member_priv_costs = member_priv_costs
+        return self
+
     def build(self) -> "Community":
-        """Build independent member models (R, I) or the joint community model (C, DP)."""
+        """Build independent member models or the joint community model."""
+        if self.contract_type == "SDP":
+            return self._build_stochastic_dp()
         if self.contract_type not in ("C", "DP"):
             for consumer in self.consumers.values():
                 consumer.build()
@@ -864,8 +1274,122 @@ class Community:
         m.update()
         return self
 
+    def _solve_stochastic_dp(self) -> StochasticResults:
+        """Optimize and extract the common SDP price plus scenario recourse."""
+        if self.m is None or not self.var:
+            raise RuntimeError("Community SDP model must be built before solving")
+        self.m.optimize()
+        status = _status_name(self.m.Status)
+        if self.m.Status != GRB.OPTIMAL:
+            raise RuntimeError(f"Community formulation SDP ended with status {status}")
+
+        T = list(range(self.data.members[0].n_hours))
+        hourly = pd.DataFrame(index=pd.Index(T, name="hour"))
+        hourly["internal_price"] = [self.var["internal_price"][t].X for t in T]
+        if self.price_discrimination:
+            for cid in self.data.member_ids:
+                hourly[f"{cid}_internal_price"] = [self.var["member_internal_price"][cid][t].X for t in T]
+
+        expected_true_cost = 0.0
+        scenario_results = {}
+        for sid, probability in self.scenario_probabilities.items():
+            ds = self.scenario_data[sid]
+            recourse = self.var["scenarios"][sid]
+            imp = recourse["import"]
+            exp = recourse["export"]
+            excess = recourse["excess"]
+            members = recourse["members"]
+
+            prefix = f"s{sid}_"
+            hourly[f"{prefix}community_import"] = [imp[t].X for t in T]
+            hourly[f"{prefix}community_export"] = [exp[t].X for t in T]
+            hourly[f"{prefix}community_excess"] = [excess[t].X for t in T]
+
+            scenario_meter_cost = 0.0
+            scenario_private_cost = 0.0
+            for member in ds.members:
+                cid = member.consumer_id
+                v = members[cid]
+                for name, variables in v.items():
+                    hourly[f"{prefix}{cid}_{name}"] = [variables[t].X for t in T]
+                pv_cost = float(member.pv_marginal_cost) * sum(v["pv"][t].X for t in T)
+                dev_cost = float(member.linear_disutility) * sum((v["delta_pos"][t].X + v["delta_neg"][t].X) for t in T)
+                scenario_private_cost += pv_cost + dev_cost
+
+            contract = ds.contract
+            first = ds.members[0]
+            beta = contract.tariff_discount_ratio
+            alpha = contract.penalty_DKK_per_kWh
+            discounted_import = (1 - beta) * first.import_tariff
+            discounted_export = (1 - beta) * first.export_tariff
+            scenario_meter_cost = sum(
+                float(first.energy_price[t]) * (imp[t].X - exp[t].X)
+                + discounted_import * imp[t].X
+                + discounted_export * exp[t].X
+                + (alpha - discounted_import) * excess[t].X
+                for t in T
+            )
+            true_cost = scenario_meter_cost + scenario_private_cost
+            expected_true_cost += probability * true_cost
+
+            scenario_settlement = {}
+            for member in ds.members:
+                cid = member.consumer_id
+                v = members[cid]
+                net_q = [v["load"][t].X - v["pv"][t].X + (v["charge"][t].X - v["discharge"][t].X if member.has_battery else 0.0) for t in T]
+                price = [self.var["internal_price"][t].X for t in T]
+                if self.price_discrimination:
+                    price = [self.var["member_internal_price"][cid][t].X for t in T]
+                payment = float(sum(p * q for p, q in zip(price, net_q)))
+                private = float(member.pv_marginal_cost * sum(v["pv"][t].X for t in T) + member.linear_disutility * sum(v["delta_pos"][t].X + v["delta_neg"][t].X for t in T))
+                scenario_settlement[cid] = {"payment_DKK": payment, "private_cost_DKK": private, "total_cost_DKK": payment + private}
+            scenario_results[sid] = {
+                "probability": probability,
+                "meter_cost_DKK": float(scenario_meter_cost),
+                "private_cost_DKK": float(scenario_private_cost),
+                "true_social_cost_DKK": float(true_cost),
+                "settlement": scenario_settlement,
+            }
+
+        risk_meta = {
+            "formulation": self.risk_formulation,
+            "risk_alpha": self.risk_alpha,
+            "risk_aversion": self.risk_aversion,
+            "chance_probability": self.chance_probability,
+            "chance_protected_constraints": (
+                [name for enabled, name in (
+                    (self.budget_balance, "budget_balance"),
+                    (self.individual_rationality, "individual_rationality"),
+                ) if enabled]
+                if self.risk_formulation == "chance" else []
+            ),
+            "stochastic_constraints": dict(self.stochastic_constraints),
+        }
+        economics = {
+            "expected_true_social_cost_DKK": float(expected_true_cost),
+            "risk_adjusted_objective_DKK": float(self.m.ObjVal),
+        }
+        if self.risk_formulation == "cvar" and "cvar_threshold" in self.var:
+            cvar = self.var["cvar_threshold"].X + sum(
+                self.scenario_probabilities[sid] * self.var["cvar_excess"][sid].X
+                for sid in self.scenario_probabilities
+            ) / (1.0 - self.risk_alpha)
+            economics["cost_cvar_DKK"] = float(cvar)
+
+        return StochasticResults(
+            question="SDP",
+            status=status,
+            objective=float(self.m.ObjVal),
+            hourly=hourly,
+            scenario_results=scenario_results,
+            scenario_probabilities=dict(self.scenario_probabilities),
+            meta={"economics": economics, "risk": risk_meta},
+        )
+
     def solve(self):
         """Solve the selected formulation and return member or community results."""
+        if self.contract_type == "SDP":
+            return self._solve_stochastic_dp()
         if self.contract_type not in ("C", "DP"):
             return {member_id: consumer.solve() for member_id, consumer in self.consumers.items()}
         if self.m is None or not self.var:
@@ -989,10 +1513,10 @@ class Community:
 class CommunityOptimizationModel:
     """Build and solve a community formulation from shared community data.
 
-    R/I use independent member meters; C and DP use one joint community meter.
+    R/I use independent member meters; C, DP, and SDP use one joint community meter.
     """
 
-    _SUPPORTED_FORMULATIONS = {"R", "I", "C", "DP"}
+    _SUPPORTED_FORMULATIONS = {"R", "I", "C", "DP", "SDP"}
 
     def __init__(
         self,
@@ -1011,7 +1535,7 @@ class CommunityOptimizationModel:
         # The underlying model and its results are created lazily by solve()
         # and remain unset until the corresponding workflow step completes.
         self.model: Community | None = None
-        self.results: dict[str, Results] | Results | None = None
+        self.results: dict[str, Results] | Results | StochasticResults | None = None
 
         # Reject invalid community data before constructing any solver model.
         self._validate_community()
@@ -1054,7 +1578,7 @@ class CommunityOptimizationModel:
         self.results = None
         return self
 
-    def solve(self) -> dict[str, Results] | Results:
+    def solve(self) -> dict[str, Results] | Results | StochasticResults:
         """Solve the selected formulation."""
         # Construct the model on first use, keeping the public workflow lazy.
         if self.model is None:
