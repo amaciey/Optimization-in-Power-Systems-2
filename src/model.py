@@ -413,9 +413,11 @@ class Community:
         individual_rationality: bool = False,
         ir_benchmark: str = "I",
         allow_infeasibility_slack: bool = False,
-        slack_penalty: float = 1e4,
+        slack_penalty: float = 50.0,
         price_discrimination: bool = False,
         use_sos1: bool = False,
+        time_limit: float = 60.0,
+        mip_gap: float = 1e-3,
     ):
         self.data = data
         self.contract_type = contract_type.upper()
@@ -440,6 +442,10 @@ class Community:
             if self.contract_type == "C":
                 self.m.Params.Method = 1
                 self.m.Params.Threads = 1
+            else:
+                self.m.Params.TimeLimit = time_limit
+                self.m.Params.MIPGap = mip_gap
+                self.m.Params.MIPFocus = 1  # prioritize finding feasible incumbents quickly
             return
 
         # Independent member models for "R" and "I"
@@ -868,7 +874,7 @@ class Community:
         self.m.optimize()
         status = _status_name(self.m.Status)
 
-        if self.m.Status != GRB.OPTIMAL:
+        if self.m.Status not in (GRB.OPTIMAL, GRB.TIME_LIMIT) or self.m.SolCount == 0:
             raise RuntimeError(f"Community formulation {self.contract_type} ended with status {status}.")
 
         d, T = self.data, list(range(self.data.members[0].n_hours))
