@@ -135,7 +135,7 @@ def main() -> None:
     ap.add_argument("--slack-penalty", type=float, default=1e4, help="penalty weight on BB/IR slacks (default: 1e4)")
     ap.add_argument("--disc", action="store_true", help="allow per-member price discrimination x_{i,t} (DP)")
     ap.add_argument("--sos1", action="store_true", help="use Gurobi SOS1 instead of big-M binaries (DP)")
-
+    ap.add_argument("--time-limit", type=float, default=60.0, help="Gurobi time limit in seconds for DP (default: 60)")
     ap.add_argument("--members", action="store_true", help="print the Assignment 1 summary of every member")
     ap.add_argument("--demo", action="store_true", help="run the scenario-generation demonstration")
     ap.add_argument("--show", action="store_true", help="display generated plots")
@@ -163,6 +163,7 @@ def main() -> None:
             slack_penalty=args.slack_penalty,
             price_discrimination=args.disc,
             use_sos1=args.sos1,
+            time_limit=args.time_limit,
         )
 
     output_dir = RESULTS_DIR / args.community / args.day / run_tag

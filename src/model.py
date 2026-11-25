@@ -420,6 +420,7 @@ class Community:
         mip_gap: float = 1e-3,
     ):
         self.data = data
+        self.time_limit = time_limit
         self.contract_type = contract_type.upper()
         self.verbose = verbose
         self.budget_balance = budget_balance
@@ -832,12 +833,19 @@ class Community:
                 dual_objs[m_i.consumer_id] - member_priv_costs[m_i.consumer_id] for m_i in d.members
             )
             if self.allow_infeasibility_slack:
-                sigma_bb = m.addVar(lb=0.0, name="slack_BB")
-                self.var["slack_BB"] = sigma_bb
+                # Two-sided: BB is an equality (payments collected = costs at the meter), so both a
+                # deficit (collected < cost) and a surplus (collected > cost) are violations and are
+                # penalized with the same weight as IR. A one-sided slack would let the manager keep
+                # any surplus for free, which is weak budget balance, not the requirement.
+                sigma_bb_def = m.addVar(lb=0.0, name="slack_BB_deficit")
+                sigma_bb_sur = m.addVar(lb=0.0, name="slack_BB_surplus")
+                self.var["slack_BB_deficit"] = sigma_bb_def
+                self.var["slack_BB_surplus"] = sigma_bb_sur
                 self.con["budget_balance"] = m.addConstr(
-                    meter_cost - total_member_payments <= sigma_bb, name="budget_balance"
+                    meter_cost - total_member_payments == sigma_bb_def - sigma_bb_sur,
+                    name="budget_balance",
                 )
-                slack_penalty_expr += self.slack_penalty * sigma_bb
+                slack_penalty_expr += self.slack_penalty * (sigma_bb_def + sigma_bb_sur)
             else:
                 self.con["budget_balance"] = m.addConstr(
                     total_member_payments == meter_cost, name="budget_balance"
@@ -862,7 +870,34 @@ class Community:
 
         m.setObjective(meter_cost + private_cost + slack_penalty_expr, GRB.MINIMIZE)
         m.update()
+        if self.budget_balance or self.individual_rationality:
+            self._warm_start_from_cap_only()
         return self
+
+    def _warm_start_from_cap_only(self) -> None:
+        """Give Gurobi the solution of DP with the cap only as a MIP start.
+
+        That solution is a complete KKT point (prices, schedules, duals and binaries) that the
+        cap-only model finds in seconds. With BB or IR added, the lower bound is the cost of C
+        from the first second; what takes time is finding any feasible point, so without a start
+        the hard BB + IR variant can hit the time limit with no solution at all. The start is a
+        hint only: no constraint or objective is changed, and Gurobi discards it if it does not
+        fit. For the slack variant it is always feasible (the slacks absorb the violations).
+        """
+        base = Community(
+            data=self.data,
+            contract_type="DP",
+            price_discrimination=self.price_discrimination,
+            use_sos1=self.use_sos1,
+            time_limit=self.time_limit,
+        ).build()
+        base.m.optimize()
+        if base.m.SolCount == 0:
+            return
+        start = {v.VarName: v.X for v in base.m.getVars()}
+        for v in self.m.getVars():
+            if v.VarName in start:
+                v.Start = start[v.VarName]
 
     def solve(self):
         """Solve the selected formulation and return member or community results."""
@@ -875,7 +910,16 @@ class Community:
         status = _status_name(self.m.Status)
 
         if self.m.Status not in (GRB.OPTIMAL, GRB.TIME_LIMIT) or self.m.SolCount == 0:
-            raise RuntimeError(f"Community formulation {self.contract_type} ended with status {status}.")
+            hint = ""
+            if self.contract_type == "DP" and (self.budget_balance or self.individual_rationality) \
+                    and not self.allow_infeasibility_slack:
+                # Without a solution, a time limit does not prove that BB/IR cannot be met.
+                hint = (" No price meeting the hard requirements was found. Run the slack variant"
+                        " (allow_infeasibility_slack=True, --slack) to see which members block and by how much.")
+            raise RuntimeError(f"Community formulation {self.contract_type} ended with status {status}.{hint}")
+        if self.m.IsMIP and self.m.Status != GRB.OPTIMAL:
+            print(f"[{self.contract_type}] {status} after {self.m.Runtime:.0f} s: best solution {self.m.ObjVal:.4f}, "
+                  f"lower bound {self.m.ObjBound:.4f}, gap {self.m.MIPGap:.2%} (not proven optimal).")
 
         d, T = self.data, list(range(self.data.members[0].n_hours))
         contract, first = d.contract, d.members[0]
@@ -965,8 +1009,9 @@ class Community:
             "collected_from_members": total_collected,
             "manager_budget_surplus": total_collected - dso_cost,
         }
-        if "slack_BB" in self.var:
-            economics["slack_BB_DKK"] = float(self.var["slack_BB"].X)
+        if "slack_BB_deficit" in self.var:
+            economics["slack_BB_deficit_DKK"] = float(self.var["slack_BB_deficit"].X)
+            economics["slack_BB_surplus_DKK"] = float(self.var["slack_BB_surplus"].X)
         if "slack_IR" in self.var:
             economics["total_slack_IR_DKK"] = float(
                 sum(self.var["slack_IR"][cid].X for cid in d.member_ids)
