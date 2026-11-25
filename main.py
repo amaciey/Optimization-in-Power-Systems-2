@@ -61,6 +61,11 @@ def run_community_case(
     model.build_model()
     results = model.solve()
 
+    if formulation == "SDP":
+        results.save(out / "community")
+        print(results)
+        return results
+
     if formulation in ("C", "DP"):
         comm_out = out / "community"
         save_tag = tag or formulation
@@ -153,6 +158,19 @@ def main() -> None:
 
     model_kwargs = {}
     run_tag = args.formulation
+    if args.formulation == "SDP":
+        from src.scenario_generation import day_data, draw_preference_scenarios, load_json
+
+        app, _ = day_data(com.raw["appliance_params"], com.raw["bus_params"],
+                          com.raw["weekly_profiles"], com.day)
+        scenarios = draw_preference_scenarios(
+            app, com.raw["params"], load_json("preference_uncertainty_params.json"),
+            n=5, seed=1, quantities=("profile",),
+        )
+        model_kwargs = dict(scenarios=scenarios, budget_balance=True,
+                            individual_rationality=True, ir_benchmark=args.ir_benchmark)
+        run_tag = f"SDP_N5_seed1_BB_IR_{args.ir_benchmark}"
+        print(f"Training SDP with {len(scenarios)} joint scenarios and one shared tariff.", flush=True)
     if args.formulation == "DP":
         run_tag = _dp_variant_tag(args)
         model_kwargs = dict(
@@ -181,6 +199,9 @@ def main() -> None:
             tag=run_tag,
             **model_kwargs,
         )
+
+        if args.formulation == "SDP":
+            return
 
         # 1. Read the shared meter for C and DP, otherwise sum member meters.
         if args.formulation in ("C", "DP"):
