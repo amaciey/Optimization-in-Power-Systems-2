@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import copy
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -443,6 +443,153 @@ def load_community(community: str = "base", day: str = "d1", data_dir: Path | st
     return CommunityData(
         community=name, community_id=raw["params"].get("community_id", name), day=day, day_name=week["days"][day].get("name", day),
         connection_bus=bus_id, members=members, contract=contract, hyperparameters=raw["params"].get("hyperparameters"), raw=raw,
+    )
+
+
+def apply_scenario_to_community(base: CommunityData, scenario: dict[str, Any]) -> CommunityData:
+    """Map one appliance-level joint scenario to a fresh, validated CommunityData.
+
+    The scenario dictionaries produced by ``scenario_generation`` remain separate
+    from the returned data: this function copies the baseline and all mutable
+    contract/member arrays instead of modifying them in place.
+    """
+    if not isinstance(scenario, dict):
+        raise TypeError("scenario must be a dictionary")
+
+    probability = scenario.get("probability")
+    if probability is not None:
+        probability = float(probability)
+        if not np.isfinite(probability) or probability < 0 or probability > 1:
+            raise ValueError("scenario probability must be a finite value in [0, 1]")
+
+    scenario_members = scenario.get("members")
+    if not isinstance(scenario_members, dict):
+        raise ValueError("scenario must contain a 'members' dictionary")
+
+    baseline_ids = set(base.member_ids)
+    scenario_ids = set(scenario_members)
+    if scenario_ids != baseline_ids:
+        missing = sorted(baseline_ids - scenario_ids)
+        extra = sorted(scenario_ids - baseline_ids)
+        raise ValueError(f"scenario member IDs do not match baseline; missing={missing}, extra={extra}")
+
+    n_hours = base.members[0].n_hours
+    scenario_member_list: list[InputData] = []
+
+    for baseline_member in base.members:
+        cid = baseline_member.consumer_id
+        appliance_scenario = scenario_members[cid]
+        if not isinstance(appliance_scenario, dict):
+            raise ValueError(f"scenario appliances for member {cid!r} must be a dictionary")
+
+        baseline_appliance_ids = set(baseline_member.raw["consumer"]["list_appliances"])
+        scenario_appliance_ids = set(appliance_scenario)
+        if scenario_appliance_ids != baseline_appliance_ids:
+            missing = sorted(baseline_appliance_ids - scenario_appliance_ids)
+            extra = sorted(scenario_appliance_ids - baseline_appliance_ids)
+            raise ValueError(
+                f"scenario appliance IDs for member {cid!r} do not match baseline; "
+                f"missing={missing}, extra={extra}"
+            )
+
+        load_scenarios = [
+            appliance
+            for appliance_id, appliance in appliance_scenario.items()
+            if "load_id" in appliance
+        ]
+        if len(load_scenarios) != 1:
+            raise ValueError(f"member {cid!r} must contain exactly one scenario load appliance")
+        load = copy.deepcopy(load_scenarios[0])
+
+        load_max = float(load["max_load_KWh_per_hour"])
+        load_min = float(load.get("min_load_KWh_per_hour") or 0.0)
+        if load_max < 0 or load_min < 0 or load_min > load_max:
+            raise ValueError(f"invalid load bounds for member {cid!r}: [{load_min}, {load_max}]")
+
+        ref_factor_value = load.get("reference_load_capacity_factor")
+        if ref_factor_value is None:
+            reference_load = None
+            min_daily_energy = baseline_member.min_daily_energy_kWh
+        else:
+            ref_factor = _as_array(ref_factor_value, f"{cid} reference_load_capacity_factor")
+            if ref_factor.shape != (n_hours,) or (ref_factor < 0).any() or (ref_factor > 1).any():
+                raise ValueError(f"invalid reference-load factor profile for member {cid!r}")
+
+            reference_load = load_max * ref_factor
+            min_daily_energy = float(load_max * ref_factor.sum())
+
+            supplied_minimum = load.get("min_total_energy_per_day_kWh")
+            if supplied_minimum is not None:
+                supplied_minimum = float(supplied_minimum)
+                if not np.isclose(supplied_minimum, min_daily_energy, rtol=1e-9, atol=1e-8):
+                    raise ValueError(
+                        f"scenario daily minimum for member {cid!r} is inconsistent: "
+                        f"supplied={supplied_minimum:.12g}, reference={min_daily_energy:.12g}"
+                    )
+
+        dmax = _opt_float(load, "max_hourly_deviation_kWh")
+        if reference_load is None:
+            load_lower = np.full(n_hours, load_min, dtype=float)
+            load_upper = np.full(n_hours, load_max, dtype=float)
+        else:
+            if dmax is not None:
+                if dmax < 0:
+                    raise ValueError(f"negative maximum hourly deviation for member {cid!r}")
+                load_lower = np.maximum(load_min, reference_load - dmax)
+                load_upper = np.minimum(load_max, reference_load + dmax)
+            else:
+                load_lower = np.full(n_hours, load_min, dtype=float)
+                load_upper = np.full(n_hours, load_max, dtype=float)
+
+            if (load_lower < 0).any() or (load_upper > load_max).any() or (load_lower > load_upper).any():
+                raise ValueError(f"invalid recomputed hourly load bounds for member {cid!r}")
+
+        linear_disutility = _opt_float(load, "linear_disutility_DKK_per_kWh")
+        quadratic_disutility = _opt_float(load, "quadratic_disutility_DKK_per_kWh2")
+        consumption_utility = _opt_float(load, "consumption_utility_DKK_per_kWh")
+
+        pv_scenario = copy.deepcopy(baseline_member.raw.get("pv"))
+        storage_scenario = copy.deepcopy(baseline_member.raw.get("storage"))
+
+        raw_scenario = copy.deepcopy(baseline_member.raw)
+        raw_scenario["load"] = load
+        raw_scenario["pv"] = pv_scenario
+        raw_scenario["storage"] = storage_scenario
+
+        scenario_member = replace(
+            baseline_member,
+            reference_load=reference_load,
+            min_daily_energy_kWh=min_daily_energy,
+            load_min_kWh=load_min,
+            load_max_kWh=load_max,
+            linear_disutility=linear_disutility,
+            quadratic_disutility=quadratic_disutility,
+            consumption_utility=consumption_utility,
+            max_hourly_deviation_kWh=dmax,
+            load_lower_kWh=load_lower,
+            load_upper_kWh=load_upper,
+            raw=raw_scenario,
+        )
+        scenario_member_list.append(scenario_member)
+
+    scenario_contract = copy.deepcopy(base.contract)
+
+    hyperparameters = copy.deepcopy(base.hyperparameters)
+    if hyperparameters is not None:
+        scenario_hyperparameters = hyperparameters
+    else:
+        scenario_hyperparameters = {}
+    scenario_hyperparameters["scenario"] = copy.deepcopy(scenario)
+
+    raw = copy.deepcopy(base.raw)
+    raw["scenario"] = copy.deepcopy(scenario)
+
+    return replace(
+        base,
+        members=scenario_member_list,
+        contract=scenario_contract,
+        hyperparameters=scenario_hyperparameters,
+        raw=raw,
     )
 
 
