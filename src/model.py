@@ -69,6 +69,10 @@ class StochasticResults:
         self.hourly.to_csv(folder / f"{stem}_hourly.csv", index_label="hour")
         with open(folder / f"{stem}_summary.txt", "w", encoding="utf-8") as f:
             f.write(f"status    : {self.status}\nobjective : {self.objective:.4f} DKK\n")
+            if self.status == "TIME_LIMIT":
+                f.write("Solution: best feasible incumbent at the time limit.\n")
+            for key, value in self.meta.get("solver", {}).items():
+                f.write(f"{key}: {value}\n")
             f.write(f"risk      : {self.meta.get('risk', {}).get('formulation', 'risk_neutral')}\n")
             for k, v in self.meta.get("economics", {}).items():
                 f.write(f"{k:<32}: {v:.4f} DKK\n")
@@ -1189,7 +1193,12 @@ class Community:
             raise RuntimeError("Community SDP model must be built before solving")
         self.m.optimize()
         status = _status_name(self.m.Status)
-        if self.m.Status != GRB.OPTIMAL:
+        if self.m.Status == GRB.TIME_LIMIT and self.m.SolCount == 0:
+            raise RuntimeError(
+                f"SDP TIME_LIMIT after {self.m.Runtime:.3f} s: no feasible incumbent found. "
+                "No tariff was extracted; feasibility remains undetermined."
+            )
+        if self.m.Status not in (GRB.OPTIMAL, GRB.TIME_LIMIT):
             raise RuntimeError(f"Community formulation SDP ended with status {status}")
 
         # Extract the shared policy once, then retain hourly recourse by scenario.
@@ -1353,7 +1362,15 @@ class Community:
             hourly=hourly,
             scenario_results=scenario_results,
             scenario_probabilities=dict(self.scenario_probabilities),
-            meta={"economics": economics, "risk": risk_meta},
+            meta={
+                "economics": economics, "risk": risk_meta,
+                "solver": {
+                    "solution_count": self.m.SolCount,
+                    "objective_bound_DKK": self.m.ObjBound,
+                    "relative_mip_gap": self.m.MIPGap,
+                    "runtime_seconds": self.m.Runtime,
+                },
+            },
         )
 
     def solve(self):
@@ -1609,3 +1626,4 @@ _STATUS = {
 
 def _status_name(code: int) -> str:
     return _STATUS.get(code, f"STATUS_{code}")
+
