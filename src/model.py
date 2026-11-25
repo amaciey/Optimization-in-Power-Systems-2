@@ -458,6 +458,7 @@ class Community:
         mip_gap: float = 1e-3,
         scenarios: list[dict] | None = None,
         stochastic_constraints: dict | None = None,
+        fixed_prices: dict[str, list[float]] | None = None,
     ):
         """Configure a community formulation.
 
@@ -467,6 +468,8 @@ class Community:
         ``stochastic_constraints``. Enable chance-protected budget balance
         or individual rationality with their corresponding arguments.
         Scenario probabilities are normalized when the model is built.
+        ``fixed_prices`` is reserved for evaluating a previously optimized
+        SDP policy on a separate scenario sample.
         """
         self.data = data
         self.contract_type = contract_type.upper()
@@ -479,6 +482,7 @@ class Community:
         self.price_discrimination = price_discrimination
         self.use_sos1 = use_sos1
         self.scenarios = scenarios
+        self.fixed_prices = fixed_prices
         self.stochastic_constraints = dict(stochastic_constraints or {})
         allowed_settings = {"risk_formulation", "risk_alpha", "risk_aversion", "chance_probability"}
         unknown_settings = self.stochastic_constraints.keys() - allowed_settings
@@ -581,7 +585,7 @@ class Community:
 
         return normalized
 
-    def _add_sdp_follower_kkt(
+    def _add_follower_kkt(
         self,
         sid: str,
         member: InputData,
@@ -590,7 +594,7 @@ class Community:
         T,
         M_dual: float,
     ):
-        """Add one scenario/member follower KKT system, mirroring the DP derivation."""
+        """Build the DP follower KKT system, using a scenario prefix for SDP."""
         m = self.m
         assert m is not None
         cid = member.consumer_id
@@ -606,7 +610,7 @@ class Community:
 
         E_min = float(member.min_daily_energy_kWh)
         d_max = float(member.max_hourly_deviation_kWh or member.load_max_kWh)
-        tag = f"{sid}_{cid}"
+        tag = f"{sid}_{cid}" if sid else cid
 
         mu_delta = m.addVars(T, lb=-c_L, ub=c_L, name=f"mu_delta_{tag}")
         mu_minus = m.addVars(T, lb=0.0, ub=M_dual, name=f"mu_minus_{tag}")
@@ -619,7 +623,7 @@ class Community:
         m.addConstrs((c_L - mu_delta[t] - omega_plus[t] == 0.0 for t in T), name=f"stat_dpos_{tag}")
         m.addConstrs((c_L + mu_delta[t] - omega_minus[t] == 0.0 for t in T), name=f"stat_dneg_{tag}")
 
-        M_E = max(0.0, float(np.sum(L_max) - E_min))
+        M_E = float(np.sum(L_max) - E_min)
         self._add_complementarity(gp.quicksum(v["load"][t] for t in T) - E_min, mu_E, M_E, M_dual, f"Emin_{tag}")
 
         for t in T:
@@ -700,12 +704,14 @@ class Community:
             )
 
         private_cost = c_pv * gp.quicksum(v["pv"][t] for t in T) + c_L * gp.quicksum(v["delta_pos"][t] + v["delta_neg"][t] for t in T)
-        return g_i, private_cost
+        duals = {"mu_E": mu_E, "mu_delta": mu_delta, "mu_minus": mu_minus, "mu_plus": mu_plus}
+        return g_i, private_cost, duals
 
     def _build_stochastic_dp(self) -> "Community":
         """Build the risk-neutral or risk-adjusted extensive-form SDP model."""
         if self.m is None:
             raise RuntimeError("SDP model was not initialized")
+        # Reject invalid risk settings before adding solver variables or constraints.
         if not 0.0 <= self.risk_alpha < 1.0:
             raise ValueError("risk_alpha must be in [0, 1)")
         if not 0.0 <= self.risk_aversion <= 1.0:
@@ -720,13 +726,30 @@ class Community:
         normalized = self._normalize_scenarios()
         m = self.m
         T = range(self.data.members[0].n_hours)
+        # Validate fixed policy vectors before using them to bound prices; this
+        # makes out-of-sample evaluation use the trained decision unchanged.
+        fixed_prices = None
+        if self.fixed_prices is not None:
+            expected_keys = set(self.data.member_ids) if self.price_discrimination else {"community"}
+            if set(self.fixed_prices) != expected_keys:
+                raise ValueError(f"fixed_prices keys must be {sorted(expected_keys)}")
+            fixed_prices = {}
+            for key, price_vector in self.fixed_prices.items():
+                values = np.asarray(price_vector, dtype=float)
+                if values.shape != (len(T),) or not np.isfinite(values).all() or (values < 0).any():
+                    raise ValueError(f"fixed price vector {key!r} must contain {len(T)} finite, nonnegative hourly values")
+                fixed_prices[key] = values
+
         max_p = max(float(np.max(ds.members[0].energy_price) + ds.contract.penalty_DKK_per_kWh) for _, _, ds in normalized)
+        if fixed_prices:
+            max_p = max(max_p, max(float(np.max(prices)) for prices in fixed_prices.values()))
         min_p = 0.0
         if any(member.linear_disutility is None for _, _, ds in normalized for member in ds.members):
             raise ValueError("SDP requires linear_disutility for every member in every scenario")
         max_cL = max(float(member.linear_disutility) for _, _, ds in normalized for member in ds.members)
         M_dual = max_p + 2.0 * max_cL + 2.0
 
+        # Only the manager's price is first-stage; it is shared by every scenario.
         x_uniform = m.addVars(T, lb=min_p, ub=max_p, name="internal_price")
         self.var = {"internal_price": x_uniform, "scenarios": {}}
         if self.price_discrimination:
@@ -738,6 +761,18 @@ class Community:
         else:
             x_member = {member.consumer_id: x_uniform for member in self.data.members}
 
+        # Pin the in-sample decision during out-of-sample evaluation; no price
+        # variables remain free, while scenario response/KKT recourse is rebuilt.
+        if fixed_prices is not None:
+            for key, values in fixed_prices.items():
+                if (values < min_p).any() or (values > max_p).any():
+                    raise ValueError(f"fixed price vector {key!r} is outside the SDP price bounds")
+                price_vars = x_member[key] if self.price_discrimination else x_uniform
+                m.addConstrs(
+                    (price_vars[t] == float(values[t]) for t in T),
+                    name=f"fixed_internal_price_{key}",
+                )
+
         scenario_data = {}
         meter_costs = {}
         private_costs = {}
@@ -745,6 +780,7 @@ class Community:
         member_priv_costs = {}
         probability_by_sid = {sid: probability for sid, probability, _ in normalized}
 
+        # Each scenario gets independent follower, meter, and settlement recourse.
         for sid, probability, ds in normalized:
             contract = ds.contract
             beta = contract.tariff_discount_ratio
@@ -811,7 +847,7 @@ class Community:
             member_priv_costs[sid] = {}
             for member in ds.members:
                 cid = member.consumer_id
-                g_i, priv_cost = self._add_sdp_follower_kkt(sid, member, members[cid], x_member[cid], T, M_dual)
+                g_i, priv_cost, _ = self._add_follower_kkt(sid, member, members[cid], x_member[cid], T, M_dual)
                 dual_objs[sid][cid] = g_i
                 member_priv_costs[sid][cid] = priv_cost
 
@@ -876,6 +912,7 @@ class Community:
                         expected_ir += probability * (dual_objs[sid][cid] - benchmarks[sid][cid])
                     m.addConstr(expected_ir <= 0.0, name=f"expected_ir_{cid}")
 
+        # CVaR regularizes expected cost against the upper tail of total social cost.
         objective = expected_cost
         if self.risk_formulation == "cvar":
             eta = m.addVar(lb=-GRB.INFINITY, name="cvar_threshold")
@@ -1058,177 +1095,12 @@ class Community:
         member_priv_costs = {}
         duals_dict = {}
 
+        # Reuse the exact follower derivation; an empty prefix keeps all legacy DP names.
         for member in d.members:
             cid = member.consumer_id
-            v = members[cid]
-            x_i = x_member[cid]
-            c_L = float(member.linear_disutility)
-            c_pv = float(member.pv_marginal_cost)
-            L_min = member.load_lower_kWh
-            L_max = member.load_upper_kWh
-            L_ref = member.reference_load
-            E_min = float(member.min_daily_energy_kWh)
-            d_max = float(member.max_hourly_deviation_kWh or member.load_max_kWh)
-
-            # Follower load & deviation dual variables
-            mu_delta = m.addVars(T, lb=-c_L, ub=c_L, name=f"mu_delta_{cid}")
-            mu_minus = m.addVars(T, lb=0.0, ub=M_dual, name=f"mu_minus_{cid}")
-            mu_plus = m.addVars(T, lb=0.0, ub=M_dual, name=f"mu_plus_{cid}")
-            mu_E = m.addVar(lb=0.0, ub=M_dual, name=f"mu_E_{cid}")
-            omega_plus = m.addVars(T, lb=0.0, ub=2.0 * c_L, name=f"omega_plus_{cid}")
-            omega_minus = m.addVars(T, lb=0.0, ub=2.0 * c_L, name=f"omega_minus_{cid}")
-
-            # Load & deviation stationarity conditions
-            m.addConstrs(
-                (x_i[t] + mu_delta[t] - mu_minus[t] + mu_plus[t] - mu_E == 0.0 for t in T),
-                name=f"stat_load_{cid}",
+            dual_objs[cid], member_priv_costs[cid], duals_dict[cid] = self._add_follower_kkt(
+                "", member, members[cid], x_member[cid], T, M_dual
             )
-            m.addConstrs((c_L - mu_delta[t] - omega_plus[t] == 0.0 for t in T), name=f"stat_dpos_{cid}")
-            m.addConstrs((c_L + mu_delta[t] - omega_minus[t] == 0.0 for t in T), name=f"stat_dneg_{cid}")
-
-            # Minimum daily energy complementarity
-            M_E = float(np.sum(L_max) - E_min)
-            self._add_complementarity(
-                gp.quicksum(v["load"][t] for t in T) - E_min, mu_E, M_E, M_dual, f"Emin_{cid}"
-            )
-
-            # Hourly load bounds & deviation complementarities (with mutual-exclusivity cuts)
-            for t in T:
-                span_L = float(L_max[t] - L_min[t])
-                u_lmin = self._add_complementarity(
-                    v["load"][t] - float(L_min[t]), mu_minus[t], span_L, M_dual, f"Lmin_{cid}_{t}"
-                )
-                u_lmax = self._add_complementarity(
-                    float(L_max[t]) - v["load"][t], mu_plus[t], span_L, M_dual, f"Lmax_{cid}_{t}"
-                )
-                if u_lmin is not None and u_lmax is not None and span_L > 1e-6:
-                    m.addConstr(u_lmin + u_lmax <= 1, name=f"mutex_L_{cid}_{t}")
-
-                # Delta_pos and Delta_neg cannot both be strictly positive
-                u_dpos = self._add_complementarity(
-                    v["delta_pos"][t], omega_plus[t], d_max, 2.0 * c_L, f"dpos_{cid}_{t}"
-                )
-                u_dneg = self._add_complementarity(
-                    v["delta_neg"][t], omega_minus[t], d_max, 2.0 * c_L, f"dneg_{cid}_{t}"
-                )
-                if u_dpos is not None and u_dneg is not None:
-                    # At most one of delta_pos > 0 (u_dpos=0) or delta_neg > 0 (u_dneg=0)
-                    m.addConstr(u_dpos + u_dneg >= 1, name=f"mutex_delta_{cid}_{t}")
-
-            # PV KKT conditions ONLY for members with PV and hours with pv_available[t] > 0
-            pv_dual_term = gp.LinExpr()
-            if member.has_pv:
-                nu_minus = {}
-                nu_plus = {}
-                for t in T:
-                    pv_avail = float(member.pv_available[t])
-                    if pv_avail > 1e-6:
-                        nu_minus[t] = m.addVar(lb=0.0, ub=M_dual, name=f"nu_minus_{cid}_{t}")
-                        nu_plus[t] = m.addVar(lb=0.0, ub=M_dual, name=f"nu_plus_{cid}_{t}")
-                        m.addConstr(
-                            c_pv - x_i[t] - nu_minus[t] + nu_plus[t] == 0.0,
-                            name=f"stat_pv_{cid}_{t}",
-                        )
-                        u_pvmin = self._add_complementarity(
-                            v["pv"][t], nu_minus[t], pv_avail, M_dual, f"pvmin_{cid}_{t}"
-                        )
-                        u_pvmax = self._add_complementarity(
-                            pv_avail - v["pv"][t], nu_plus[t], pv_avail, M_dual, f"pvmax_{cid}_{t}"
-                        )
-                        if u_pvmin is not None and u_pvmax is not None:
-                            m.addConstr(u_pvmin + u_pvmax <= 1, name=f"mutex_pv_{cid}_{t}")
-                        pv_dual_term += pv_avail * nu_plus[t]
-
-            # Strong-duality objective expression g_i(Phi_i)
-            g_i = (
-                gp.quicksum(
-                    -float(L_ref[t]) * mu_delta[t]
-                    + float(L_min[t]) * mu_minus[t]
-                    - float(L_max[t]) * mu_plus[t]
-                    for t in T
-                )
-                - pv_dual_term
-                + E_min * mu_E
-            )
-
-            # Battery KKT stationarity, complementarity, and dual objective terms
-            if member.has_battery:
-                E_cap = float(member.battery_capacity_kWh)
-                P_ch = float(member.battery_max_charge_kW)
-                P_dis = float(member.battery_max_discharge_kW)
-                eta_ch = float(member.battery_charging_efficiency)
-                eta_dis = float(member.battery_discharging_efficiency)
-                E_0 = float(member.battery_initial_soc_kWh)
-
-                xi = m.addVars(T, lb=-M_dual, ub=M_dual, name=f"xi_{cid}")
-                xi_end = m.addVar(lb=-M_dual, ub=M_dual, name=f"xi_end_{cid}")
-                phi_ch_min = m.addVars(T, lb=0.0, ub=M_dual, name=f"phi_ch_min_{cid}")
-                phi_ch_max = m.addVars(T, lb=0.0, ub=M_dual, name=f"phi_ch_max_{cid}")
-                phi_dis_min = m.addVars(T, lb=0.0, ub=M_dual, name=f"phi_dis_min_{cid}")
-                phi_dis_max = m.addVars(T, lb=0.0, ub=M_dual, name=f"phi_dis_max_{cid}")
-                psi_min = m.addVars(T, lb=0.0, ub=M_dual, name=f"psi_min_{cid}")
-                psi_max = m.addVars(T, lb=0.0, ub=M_dual, name=f"psi_max_{cid}")
-
-                # At t = 23, soc[23] == E_0 is fixed strictly inside (0, E_cap), so bound duals are 0
-                last_t = member.n_hours - 1
-                m.addConstr(psi_min[last_t] == 0.0, name=f"psi_min_end_{cid}")
-                m.addConstr(psi_max[last_t] == 0.0, name=f"psi_max_end_{cid}")
-
-                m.addConstrs(
-                    (x_i[t] - eta_ch * xi[t] - phi_ch_min[t] + phi_ch_max[t] == 0.0 for t in T),
-                    name=f"stat_ch_{cid}",
-                )
-                m.addConstrs(
-                    (-x_i[t] + (1.0 / eta_dis) * xi[t] - phi_dis_min[t] + phi_dis_max[t] == 0.0 for t in T),
-                    name=f"stat_dis_{cid}",
-                )
-                for t in T:
-                    if t < last_t:
-                        m.addConstr(
-                            xi[t] - xi[t + 1] - psi_min[t] + psi_max[t] == 0.0,
-                            name=f"stat_soc_{cid}_{t}",
-                        )
-                    else:
-                        m.addConstr(
-                            xi[t] + xi_end - psi_min[t] + psi_max[t] == 0.0,
-                            name=f"stat_soc_{cid}_{t}",
-                        )
-                    u_chmin = self._add_complementarity(
-                        v["charge"][t], phi_ch_min[t], P_ch, M_dual, f"chmin_{cid}_{t}"
-                    )
-                    u_chmax = self._add_complementarity(
-                        P_ch - v["charge"][t], phi_ch_max[t], P_ch, M_dual, f"chmax_{cid}_{t}"
-                    )
-                    u_dismin = self._add_complementarity(
-                        v["discharge"][t], phi_dis_min[t], P_dis, M_dual, f"dismin_{cid}_{t}"
-                    )
-                    u_dismax = self._add_complementarity(
-                        P_dis - v["discharge"][t], phi_dis_max[t], P_dis, M_dual, f"dismax_{cid}_{t}"
-                    )
-                    if u_chmin is not None and u_chmax is not None:
-                        m.addConstr(u_chmin + u_chmax <= 1, name=f"mutex_ch_{cid}_{t}")
-                    if u_dismin is not None and u_dismax is not None:
-                        m.addConstr(u_dismin + u_dismax <= 1, name=f"mutex_dis_{cid}_{t}")
-
-                    if t < last_t:
-                        u_socmin = self._add_complementarity(
-                            v["soc"][t], psi_min[t], E_cap, M_dual, f"socmin_{cid}_{t}"
-                        )
-                        u_socmax = self._add_complementarity(
-                            E_cap - v["soc"][t], psi_max[t], E_cap, M_dual, f"socmax_{cid}_{t}"
-                        )
-                        if u_socmin is not None and u_socmax is not None:
-                            m.addConstr(u_socmin + u_socmax <= 1, name=f"mutex_soc_{cid}_{t}")
-
-                g_i -= E_0 * (xi[0] + xi_end) + gp.quicksum(
-                    P_ch * phi_ch_max[t] + P_dis * phi_dis_max[t] + E_cap * psi_max[t] for t in T
-                )
-
-            dual_objs[cid] = g_i
-            member_priv_costs[cid] = c_pv * gp.quicksum(v["pv"][t] for t in T) + c_L * gp.quicksum(
-                v["delta_pos"][t] + v["delta_neg"][t] for t in T
-            )
-            duals_dict[cid] = {"mu_E": mu_E, "mu_delta": mu_delta, "mu_minus": mu_minus, "mu_plus": mu_plus}
 
         self.var["follower_duals"] = duals_dict
         self.dual_objs = dual_objs
@@ -1283,6 +1155,7 @@ class Community:
         if self.m.Status != GRB.OPTIMAL:
             raise RuntimeError(f"Community formulation SDP ended with status {status}")
 
+        # Extract the shared policy once, then retain hourly recourse by scenario.
         T = list(range(self.data.members[0].n_hours))
         hourly = pd.DataFrame(index=pd.Index(T, name="hour"))
         hourly["internal_price"] = [self.var["internal_price"][t].X for t in T]
@@ -1349,6 +1222,8 @@ class Community:
                 "private_cost_DKK": float(scenario_private_cost),
                 "true_social_cost_DKK": float(true_cost),
                 "settlement": scenario_settlement,
+                "index": ds.hyperparameters.get("scenario", {}).get("index"),
+                "theta": ds.hyperparameters.get("scenario", {}).get("theta"),
             }
 
         risk_meta = {
@@ -1363,6 +1238,7 @@ class Community:
                 ) if enabled]
                 if self.risk_formulation == "chance" else []
             ),
+            "fixed_price_evaluation": self.fixed_prices is not None,
             "stochastic_constraints": dict(self.stochastic_constraints),
         }
         economics = {
@@ -1565,7 +1441,6 @@ class CommunityOptimizationModel:
         """Construct fresh member models for the selected formulation."""
         # Build a new underlying Community model so repeated calls start from
         # a clean formulation rather than reusing a solved model.
-        contract_type = self.formulation
         self.model = Community(
             data=self.community,
             contract_type=self.formulation,
@@ -1592,12 +1467,44 @@ class CommunityOptimizationModel:
         self.results = self.model.solve()
         return self.results
 
-    def extract_results(self) -> dict[str, Results] | Results:
+    def extract_results(self) -> dict[str, Results] | Results | StochasticResults:
         """Return solved member results without re-solving the models."""
         # Results are only available after a successful solve().
         if self.results is None:
             raise RuntimeError("CommunityOptimizationModel has not been solved yet.")
         return self.results
+
+
+def evaluate_sdp_policy(
+    data: CommunityData,
+    scenarios: list[dict],
+    policy: StochasticResults,
+    *,
+    verbose: bool = False,
+    use_sos1: bool = False,
+) -> StochasticResults:
+    """Evaluate fixed in-sample SDP prices against a separate scenario set."""
+    # Reuse the extensive-form response model but fix every first-stage price
+    # to the trained policy, preventing out-of-sample price re-optimization.
+    member_prices = {
+        cid: policy.hourly[f"{cid}_internal_price"].to_numpy()
+        for cid in data.member_ids
+        if f"{cid}_internal_price" in policy.hourly
+    }
+    price_discrimination = bool(member_prices)
+    fixed_prices = member_prices or {
+        "community": policy.hourly["internal_price"].to_numpy()
+    }
+    return Community(
+        data=data,
+        contract_type="SDP",
+        verbose=verbose,
+        scenarios=scenarios,
+        price_discrimination=price_discrimination,
+        fixed_prices=fixed_prices,
+        use_sos1=use_sos1,
+    ).build().solve()
+
 
 _STATUS = {
     GRB.OPTIMAL: "OPTIMAL", GRB.INFEASIBLE: "INFEASIBLE", GRB.UNBOUNDED: "UNBOUNDED",
