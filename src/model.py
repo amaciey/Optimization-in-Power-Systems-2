@@ -69,6 +69,10 @@ class StochasticResults:
         self.hourly.to_csv(folder / f"{stem}_hourly.csv", index_label="hour")
         with open(folder / f"{stem}_summary.txt", "w", encoding="utf-8") as f:
             f.write(f"status    : {self.status}\nobjective : {self.objective:.4f} DKK\n")
+            if self.status == "TIME_LIMIT":
+                f.write("Solution: best feasible incumbent at the time limit.\n")
+            for key, value in self.meta.get("solver", {}).items():
+                f.write(f"{key}: {value}\n")
             f.write(f"risk      : {self.meta.get('risk', {}).get('formulation', 'risk_neutral')}\n")
             for k, v in self.meta.get("economics", {}).items():
                 f.write(f"{k:<32}: {v:.4f} DKK\n")
@@ -825,6 +829,8 @@ class Community:
             imp = m.addVars(T, lb=0.0, name=f"community_import_{sid}")
             exp = m.addVars(T, lb=0.0, name=f"community_export_{sid}")
             excess = m.addVars(T, lb=0.0, name=f"community_excess_{sid}")
+            import_mode = m.addVars(T, vtype=GRB.BINARY, name=f"import_mode_{sid}")
+            over_capacity = m.addVars(T, vtype=GRB.BINARY, name=f"over_capacity_{sid}")
 
             def net(member, t):
                 v = members[member.consumer_id]
@@ -833,9 +839,36 @@ class Community:
                     expr += v["charge"][t] - v["discharge"][t]
                 return expr
 
-            m.addConstrs((imp[t] - exp[t] == gp.quicksum(net(member, t) for member in ds.members) for t in T), name=f"community_balance_{sid}")
-            m.addConstrs((imp[t] - excess[t] <= float(contract.capacity_limit_kW[t]) for t in T), name=f"community_capacity_{sid}")
-            m.addConstrs((excess[t] <= imp[t] for t in T), name=f"community_excess_import_{sid}")
+            m.addConstrs(
+                (imp[t] - exp[t] == gp.quicksum(net(member, t) for member in ds.members) for t in T),
+                name=f"community_balance_{sid}",
+            )
+            for t in T:
+                capacity = float(contract.capacity_limit_kW[t])
+                m.addGenConstrIndicator(
+                    import_mode[t], True, exp[t], GRB.EQUAL, 0.0,
+                    name=f"meter_import_only_{sid}_{t}",
+                )
+                m.addGenConstrIndicator(
+                    import_mode[t], False, imp[t], GRB.EQUAL, 0.0,
+                    name=f"meter_export_only_{sid}_{t}",
+                )
+                m.addGenConstrIndicator(
+                    over_capacity[t], True, imp[t], GRB.GREATER_EQUAL, capacity,
+                    name=f"meter_over_capacity_{sid}_{t}",
+                )
+                m.addGenConstrIndicator(
+                    over_capacity[t], True, excess[t] - imp[t], GRB.EQUAL, -capacity,
+                    name=f"meter_exact_excess_{sid}_{t}",
+                )
+                m.addGenConstrIndicator(
+                    over_capacity[t], False, imp[t], GRB.LESS_EQUAL, capacity,
+                    name=f"meter_within_capacity_{sid}_{t}",
+                )
+                m.addGenConstrIndicator(
+                    over_capacity[t], False, excess[t], GRB.EQUAL, 0.0,
+                    name=f"meter_zero_excess_{sid}_{t}",
+                )
 
             meter_cost = gp.quicksum(
                 float(first.energy_price[t]) * (imp[t] - exp[t])
@@ -855,7 +888,15 @@ class Community:
             scenario_data[sid] = ds
             meter_costs[sid] = meter_cost
             private_costs[sid] = private_cost
-            self.var["scenarios"][sid] = {"probability": probability, "members": members, "import": imp, "export": exp, "excess": excess}
+            self.var["scenarios"][sid] = {
+                "probability": probability,
+                "members": members,
+                "import": imp,
+                "export": exp,
+                "excess": excess,
+                "import_mode": import_mode,
+                "over_capacity": over_capacity,
+            }
 
         expected_meter = gp.LinExpr()
         expected_private = gp.LinExpr()
@@ -1187,7 +1228,12 @@ class Community:
             raise RuntimeError("Community SDP model must be built before solving")
         self.m.optimize()
         status = _status_name(self.m.Status)
-        if self.m.Status != GRB.OPTIMAL:
+        if self.m.Status == GRB.TIME_LIMIT and self.m.SolCount == 0:
+            raise RuntimeError(
+                f"SDP TIME_LIMIT after {self.m.Runtime:.3f} s: no feasible incumbent found. "
+                "No tariff was extracted; feasibility remains undetermined."
+            )
+        if self.m.Status not in (GRB.OPTIMAL, GRB.TIME_LIMIT):
             raise RuntimeError(f"Community formulation SDP ended with status {status}")
 
         # Extract the shared policy once, then retain hourly recourse by scenario.
@@ -1199,6 +1245,9 @@ class Community:
                 hourly[f"{cid}_internal_price"] = [self.var["member_internal_price"][cid][t].X for t in T]
 
         expected_true_cost = 0.0
+        expected_model_meter_cost = 0.0
+        expected_net_meter_bill = 0.0
+        expected_settlement_balance = 0.0
         scenario_results = {}
         for sid, probability in self.scenario_probabilities.items():
             ds = self.scenario_data[sid]
@@ -1213,13 +1262,19 @@ class Community:
             hourly[f"{prefix}community_export"] = [exp[t].X for t in T]
             hourly[f"{prefix}community_excess"] = [excess[t].X for t in T]
 
-            scenario_meter_cost = 0.0
             scenario_private_cost = 0.0
+            net_flow = np.zeros(len(T), dtype=float)
             for member in ds.members:
                 cid = member.consumer_id
                 v = members[cid]
                 for name, variables in v.items():
                     hourly[f"{prefix}{cid}_{name}"] = [variables[t].X for t in T]
+                member_net_flow = np.array([
+                    v["load"][t].X - v["pv"][t].X
+                    + (v["charge"][t].X - v["discharge"][t].X if member.has_battery else 0.0)
+                    for t in T
+                ])
+                net_flow += member_net_flow
                 pv_cost = float(member.pv_marginal_cost) * sum(v["pv"][t].X for t in T)
                 dev_cost = float(member.linear_disutility) * sum((v["delta_pos"][t].X + v["delta_neg"][t].X) for t in T)
                 scenario_private_cost += pv_cost + dev_cost
@@ -1230,15 +1285,44 @@ class Community:
             alpha = contract.penalty_DKK_per_kWh
             discounted_import = (1 - beta) * first.import_tariff
             discounted_export = (1 - beta) * first.export_tariff
-            scenario_meter_cost = sum(
+            scenario_model_meter_cost = sum(
                 float(first.energy_price[t]) * (imp[t].X - exp[t].X)
                 + discounted_import * imp[t].X
                 + discounted_export * exp[t].X
                 + (alpha - discounted_import) * excess[t].X
                 for t in T
             )
+            net_import = np.maximum(net_flow, 0.0)
+            net_export = np.maximum(-net_flow, 0.0)
+            net_excess = np.maximum(net_import - np.asarray(contract.capacity_limit_kW, dtype=float), 0.0)
+            scenario_meter_cost = float(sum(
+                float(first.energy_price[t]) * (net_import[t] - net_export[t])
+                + discounted_import * net_import[t]
+                + discounted_export * net_export[t]
+                + (alpha - discounted_import) * net_excess[t]
+                for t in T
+            ))
+            modeled_import = np.array([imp[t].X for t in T])
+            modeled_export = np.array([exp[t].X for t in T])
+            modeled_excess = np.array([excess[t].X for t in T])
+            if not (
+                np.allclose(modeled_import, net_import, rtol=1e-7, atol=1e-6)
+                and np.allclose(modeled_export, net_export, rtol=1e-7, atol=1e-6)
+                and np.allclose(modeled_excess, net_excess, rtol=1e-7, atol=1e-6)
+                and np.isclose(scenario_model_meter_cost, scenario_meter_cost, rtol=1e-7, atol=1e-5)
+            ):
+                raise RuntimeError(
+                    f"SDP meter accounting did not reconcile with net flow in scenario {sid!r}"
+                )
+            hourly[f"{prefix}community_net_flow"] = net_flow
+            hourly[f"{prefix}community_import_from_net"] = net_import
+            hourly[f"{prefix}community_export_from_net"] = net_export
+            hourly[f"{prefix}community_excess_from_net"] = net_excess
+
             true_cost = scenario_meter_cost + scenario_private_cost
             expected_true_cost += probability * true_cost
+            expected_model_meter_cost += probability * scenario_model_meter_cost
+            expected_net_meter_bill += probability * scenario_meter_cost
 
             scenario_settlement = {}
             for member in ds.members:
@@ -1251,15 +1335,30 @@ class Community:
                 payment = float(sum(p * q for p, q in zip(price, net_q)))
                 private = float(member.pv_marginal_cost * sum(v["pv"][t].X for t in T) + member.linear_disutility * sum(v["delta_pos"][t].X + v["delta_neg"][t].X for t in T))
                 scenario_settlement[cid] = {"payment_DKK": payment, "private_cost_DKK": private, "total_cost_DKK": payment + private}
+            settlement_balance = sum(
+                entry["payment_DKK"] for entry in scenario_settlement.values()
+            ) - scenario_meter_cost
+            expected_settlement_balance += probability * settlement_balance
             scenario_results[sid] = {
                 "probability": probability,
                 "meter_cost_DKK": float(scenario_meter_cost),
+                "model_meter_cost_DKK": float(scenario_model_meter_cost),
+                "meter_reconciliation_error_DKK": float(scenario_model_meter_cost - scenario_meter_cost),
+                "settlement_balance_DKK": float(settlement_balance),
                 "private_cost_DKK": float(scenario_private_cost),
                 "true_social_cost_DKK": float(true_cost),
                 "settlement": scenario_settlement,
                 "index": ds.hyperparameters.get("scenario", {}).get("index"),
                 "theta": ds.hyperparameters.get("scenario", {}).get("theta"),
             }
+
+        if self.budget_balance and self.risk_formulation != "chance" and not np.isclose(
+            expected_settlement_balance, 0.0, rtol=1e-7, atol=1e-5
+        ):
+            raise RuntimeError(
+                "SDP expected budget balance did not reconcile with settlement payments "
+                "and net-flow meter bills"
+            )
 
         risk_meta = {
             "formulation": self.risk_formulation,
@@ -1278,6 +1377,10 @@ class Community:
         }
         economics = {
             "expected_true_social_cost_DKK": float(expected_true_cost),
+            "expected_model_meter_cost_DKK": float(expected_model_meter_cost),
+            "expected_net_flow_meter_bill_DKK": float(expected_net_meter_bill),
+            "expected_meter_reconciliation_error_DKK": float(expected_model_meter_cost - expected_net_meter_bill),
+            "expected_settlement_balance_DKK": float(expected_settlement_balance),
             "risk_adjusted_objective_DKK": float(self.m.ObjVal),
         }
         if self.risk_formulation == "cvar" and "cvar_threshold" in self.var:
@@ -1294,7 +1397,15 @@ class Community:
             hourly=hourly,
             scenario_results=scenario_results,
             scenario_probabilities=dict(self.scenario_probabilities),
-            meta={"economics": economics, "risk": risk_meta},
+            meta={
+                "economics": economics, "risk": risk_meta,
+                "solver": {
+                    "solution_count": self.m.SolCount,
+                    "objective_bound_DKK": self.m.ObjBound,
+                    "relative_mip_gap": self.m.MIPGap,
+                    "runtime_seconds": self.m.Runtime,
+                },
+            },
         )
 
     def solve(self):
@@ -1560,3 +1671,4 @@ _STATUS = {
 
 def _status_name(code: int) -> str:
     return _STATUS.get(code, f"STATUS_{code}")
+
