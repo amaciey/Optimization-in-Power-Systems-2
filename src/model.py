@@ -1533,6 +1533,13 @@ class Community:
         ) * hourly["community_excess"]
         dso_cost = float((energy + tariff + penalty).sum())
 
+        # Each member's cost alone, without contract (R) and with its own contract (I), so every run
+        # reports each member's gain against both, as in Question 1. Independent of the IR switch.
+        alone = {}
+        for bench in ("R", "I"):
+            bench_res = Community(data=d, contract_type=bench).build().solve()
+            alone[bench] = {cid: float(res.objective) for cid, res in bench_res.items()}
+
         # Per-member settlement and welfare summary
         settlement = {}
         total_collected = 0.0
@@ -1560,6 +1567,10 @@ class Community:
                 "private_cost_DKK": priv,
                 "total_cost_DKK": payment + priv,
             }
+            for bench in ("R", "I"):
+                # Positive gain: the member is better off in the community than alone.
+                settlement[cid][f"cost_alone_{bench}_DKK"] = alone[bench][cid]
+                settlement[cid][f"gain_vs_{bench}_DKK"] = alone[bench][cid] - (payment + priv)
             if hasattr(self, "benchmark_costs") and cid in self.benchmark_costs:
                 settlement[cid]["benchmark_cost_DKK"] = self.benchmark_costs[cid]
                 settlement[cid]["ir_gain_DKK"] = self.benchmark_costs[cid] - (payment + priv)
