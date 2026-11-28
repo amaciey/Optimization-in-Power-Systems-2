@@ -1408,18 +1408,48 @@ class Community:
             },
         )
 
-    def solve(self):
-        """Solve the selected formulation and return member or community results."""
-        if self.contract_type == "SDP":
-            return self._solve_stochastic_dp()
-        if self.contract_type not in ("C", "DP"):
-            return {member_id: consumer.solve() for member_id, consumer in self.consumers.items()}
-        if self.m is None or not self.var:
-            raise RuntimeError(f"Community {self.contract_type} model must be built before solving.")
+    def _meter_burn(self) -> float:
+        """kWh by which the solved meter differs from the bill of the net flow.
 
+        Counts imports and exports in the same hour, and excess above max(import - cap, 0).
+        Both only add to the DSO bill, so they are never chosen in C or in DP without budget
+        balance; with budget balance as an equality they could be used to "burn" a surplus.
+        """
+        cap = np.asarray(self.data.contract.capacity_limit_kW, dtype=float)
+        T = range(self.data.members[0].n_hours)
+        imp = np.array([self.var["import"][t].X for t in T])
+        exp = np.array([self.var["export"][t].X for t in T])
+        exc = np.array([self.var["excess"][t].X for t in T])
+        return float(np.minimum(imp, exp).sum() + np.abs(exc - np.maximum(imp - cap, 0.0)).sum())
+
+    def _add_exact_meter(self) -> None:
+        """Make the meter exact with the same indicator constraints as SDP.
+
+        One binary per hour fixes the direction of the flow and one whether the cap is exceeded,
+        so the DSO bill is the one the net flow gives. Added only when needed (see solve): they
+        make DP an order of magnitude slower, and the model without them is a relaxation, so a
+        solution that burns nothing is already optimal for the exact meter.
+        """
+        m, T, cap = self.m, range(self.data.members[0].n_hours), self.data.contract.capacity_limit_kW
+        imp, exp, excess = self.var["import"], self.var["export"], self.var["excess"]
+        import_mode = m.addVars(T, vtype=GRB.BINARY, name="import_mode")
+        over_capacity = m.addVars(T, vtype=GRB.BINARY, name="over_capacity")
+        self.var["import_mode"] = import_mode
+        self.var["over_capacity"] = over_capacity
+        for t in T:
+            capacity = float(cap[t])
+            m.addGenConstrIndicator(import_mode[t], True, exp[t], GRB.EQUAL, 0.0, name=f"meter_import_only_{t}")
+            m.addGenConstrIndicator(import_mode[t], False, imp[t], GRB.EQUAL, 0.0, name=f"meter_export_only_{t}")
+            m.addGenConstrIndicator(over_capacity[t], True, imp[t], GRB.GREATER_EQUAL, capacity, name=f"meter_over_capacity_{t}")
+            m.addGenConstrIndicator(over_capacity[t], True, excess[t] - imp[t], GRB.EQUAL, -capacity, name=f"meter_exact_excess_{t}")
+            m.addGenConstrIndicator(over_capacity[t], False, imp[t], GRB.LESS_EQUAL, capacity, name=f"meter_within_capacity_{t}")
+            m.addGenConstrIndicator(over_capacity[t], False, excess[t], GRB.EQUAL, 0.0, name=f"meter_zero_excess_{t}")
+        m.update()
+
+    def _optimize_and_check(self) -> str:
+        """Optimize, raise if there is no solution, report the gap if not proven optimal."""
         self.m.optimize()
         status = _status_name(self.m.Status)
-
         if self.m.Status not in (GRB.OPTIMAL, GRB.TIME_LIMIT) or self.m.SolCount == 0:
             hint = ""
             if self.contract_type == "DP" and (self.budget_balance or self.individual_rationality) \
@@ -1431,6 +1461,29 @@ class Community:
         if self.m.IsMIP and self.m.Status != GRB.OPTIMAL:
             print(f"[{self.contract_type}] {status} after {self.m.Runtime:.0f} s: best solution {self.m.ObjVal:.4f}, "
                   f"lower bound {self.m.ObjBound:.4f}, gap {self.m.MIPGap:.2%} (not proven optimal).")
+        return status
+
+    def solve(self):
+        """Solve the selected formulation and return member or community results."""
+        if self.contract_type == "SDP":
+            return self._solve_stochastic_dp()
+        if self.contract_type not in ("C", "DP"):
+            return {member_id: consumer.solve() for member_id, consumer in self.consumers.items()}
+        if self.m is None or not self.var:
+            raise RuntimeError(f"Community {self.contract_type} model must be built before solving.")
+
+        status = self._optimize_and_check()
+
+        # DP: if the solution burns money at the meter, make the meter exact and solve again.
+        exact_meter = False
+        if self.contract_type == "DP":
+            burn = self._meter_burn()
+            if burn > 1e-6:
+                print(f"[DP] the meter differs from the net-flow bill by {burn:.4f} kWh; "
+                      "adding the exact meter (as in SDP) and solving again.")
+                self._add_exact_meter()
+                exact_meter = True
+                status = self._optimize_and_check()
 
         d, T = self.data, list(range(self.data.members[0].n_hours))
         contract, first = d.contract, d.members[0]
@@ -1538,7 +1591,7 @@ class Community:
             duals={
                 "capacity_rent": float(np.dot(hourly["dual_capacity"], contract.capacity_limit_kW))
             },
-            meta={"economics": economics, "settlement": settlement},
+            meta={"economics": economics, "settlement": settlement, "exact_meter_added": exact_meter},
         )
 
 
